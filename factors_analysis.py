@@ -9,6 +9,7 @@
 import pandas as pd
 import numpy as np
 import inspect
+from scipy import stats
 
 # 导入数据加载模块和因子模块
 import wind_data_loader
@@ -178,40 +179,75 @@ def calculate_benchmark_returns(prices_df, rebalance_freq):
     return benchmark_returns
 
 
+def calc_rank_ic(factor_series, return_series):
+    """
+    计算Rank IC (Spearman相关系数)
+    
+    参数:
+        factor_series: pd.Series, 因子值序列
+        return_series: pd.Series, 收益率序列
+    
+    返回:
+        float, Rank IC值
+    """
+    valid_mask = factor_series.notna() & return_series.notna()
+    if valid_mask.sum() < 3:
+        return np.nan
+    
+    factor_valid = factor_series[valid_mask]
+    return_valid = return_series[valid_mask]
+    
+    ic, _ = stats.spearmanr(factor_valid, return_valid)
+    return ic
+
+
 def calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, n_layers=N_LAYERS):
     """
     计算因子的 IC 和 IR
     
-    返回:
-    tuple: (ic_series, ic_cumsum, ic_mean, ic_std, icir)
-    """
-    valid_dates = factor_df.index[window::rebalance_freq]
-    valid_dates = [d for d in valid_dates if d in forward_returns_df.index]
+    参数:
+        factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
+        forward_returns_df: pd.DataFrame, 未来收益率 (index=日期, columns=行业)
+        window: int, 回溯窗口（此参数保留用于兼容性，但不再用于调仓日期计算）
+        rebalance_freq: int, 调仓频率（交易日），默认20
+        n_layers: int, 分层数（此参数保留用于兼容性）
     
-    ic_series = []
+    返回:
+        tuple: (ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean)
+    """
+    # 获取调仓日期（从第0天开始，每隔rebalance_freq天取一个调仓日）
+    all_dates = factor_df.index
+    rebalance_indices = list(range(0, len(all_dates), rebalance_freq))
+    rebalance_dates = all_dates[rebalance_indices]
+    
+    # 计算每个调仓日的IC
+    ic_list = []
     ic_dates = []
-    for date in valid_dates:
-        fac = factor_df.loc[date]
-        ret = forward_returns_df.loc[date]
-        
-        valid_mask = ~(fac.isna() | ret.isna())
-        fac = fac[valid_mask]
-        ret = ret[valid_mask]
-        
-        if len(fac) < n_layers * 2:
+    
+    for date in rebalance_dates:
+        if date not in factor_df.index or date not in forward_returns_df.index:
             continue
         
-        ic = fac.corr(ret, method='spearman')
-        ic_series.append(ic)
-        ic_dates.append(date)
+        ic = calc_rank_ic(factor_df.loc[date], forward_returns_df.loc[date])
+        
+        if not np.isnan(ic):
+            ic_list.append(ic)
+            ic_dates.append(date)
     
-    ic_series = pd.Series(ic_series, index=ic_dates)
-    ic_cumsum = ic_series.cumsum()  # IC累积序列
-    ic_mean = ic_series.mean() if len(ic_series) > 0 else 0
-    ic_std = ic_series.std() if len(ic_series) > 0 else 0
-    icir = ic_mean / ic_std if ic_std != 0 else 0
+    # 构建IC时间序列
+    ic_series = pd.Series(ic_list, index=ic_dates)
     
-    return ic_series, ic_cumsum, ic_mean, ic_std, icir
+    # 计算IC累积序列
+    ic_cumsum = ic_series.cumsum()
+    
+    # 计算统计指标
+    ic_mean = ic_series.mean() if len(ic_series) > 0 else np.nan
+    ic_std = ic_series.std() if len(ic_series) > 0 else np.nan
+    icir = ic_mean / ic_std if ic_std > 0 else np.nan
+    ic_win_rate = (ic_series > 0).sum() / len(ic_series) if len(ic_series) > 0 else np.nan
+    ic_abs_mean = ic_series.abs().mean() if len(ic_series) > 0 else np.nan
+    
+    return ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean
 
 
 def stratified_backtest(factor_df, prices_df, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, n_layers=N_LAYERS):
@@ -428,7 +464,7 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     forward_returns_df = data.prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
     
     # 计算IC/IR（包含IC累积序列）
-    ic_series, ic_cumsum, ic_mean, ic_std, icir = calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq)
+    ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean = calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq)
     
     # 分层回测
     nav_df, layer_returns, layer_holdings = stratified_backtest(factor_df, data.prices_df, window, rebalance_freq)
@@ -454,6 +490,8 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     return {
         'ic_mean': ic_mean,
         'icir': icir,
+        'ic_win_rate': ic_win_rate,
+        'ic_abs_mean': ic_abs_mean,
         'ic_series': ic_series,
         'ic_cumsum': ic_cumsum,
         'nav_df': nav_df,
@@ -521,8 +559,9 @@ def create_factor_summary_df(factor_name, factor_results, windows=WINDOWS):
         
         window_data = {}
         # IC和ICIR保留4位小数
-        window_data['IC均值'] = round(result['ic_mean'], 4)
-        window_data['ICIR'] = round(result['icir'], 4)
+        window_data['IC均值'] = round(result['ic_mean'], 4) if not np.isnan(result['ic_mean']) else np.nan
+        window_data['ICIR'] = round(result['icir'], 4) if not np.isnan(result['icir']) else np.nan
+        window_data['IC胜率'] = round(result['ic_win_rate'], 4) if not np.isnan(result['ic_win_rate']) else np.nan
         
         # 按G5, G4, G3, G2, G1顺序添加各层指标
         layer_order = ['G5', 'G4', 'G3', 'G2', 'G1']
@@ -680,6 +719,9 @@ def create_ic_cumsum_df(factor_results, windows=WINDOWS):
     
     # 保留四位小数
     df = df.round(4)
+    
+    # 删除含有空值的行，只保留所有窗口都有值的行
+    df = df.dropna()
     
     return df
 
@@ -897,9 +939,9 @@ if __name__ == "__main__":
     WINDOWS_TO_TEST = [20, 60, 120, 240]  # 测试窗口
     OUTPUT_FILE = 'factors_analysis_report.xlsx'
 
-    # 固定日期范围
-    start_date = "2020-01-01"
-    end_date = None # 最新日期
+    # 固定日期范围（设为None使用全部数据，与单因子测试.py保持一致）
+    start_date = None  # 使用全部数据
+    end_date = None    # 最新日期
     
     # 加载所有数据（一次性加载）
     print(f"\n正在加载 {start_date} 至 最新 日期的数据...")
