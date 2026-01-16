@@ -24,7 +24,7 @@ def momentum(prices_df, window):
     return prices_df.pct_change(window)
 
 
-def momentum_std(prices_df, window):
+def momentum_zscore(prices_df, window):
     """
     标准化动量因子（横截面Z-score标准化）
     
@@ -142,7 +142,7 @@ def momentum_calmar_ratio(prices_df, window):
     return calmar
 
 
-def momentum_rank_std(prices_df, window):
+def momentum_rank_zscore(prices_df, window):
     """
     Rank标准化动量因子（横截面排名标准化）
     
@@ -311,8 +311,8 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_perio
         return predictions
 
 
-def momentum_pv_icir_weighted(prices_df, amount_df, short_window=20, long_window=240,
-                               rebalance_freq=20, lookback_num_for_icir=None):
+def momentum_price_volume_icir(prices_df, amount_df, window=20,
+                                rebalance_freq=20, lookback_num_for_icir=None):
     """
     量价清洗ICIR加权动量因子（多维度改进的复合动量）
     
@@ -329,14 +329,16 @@ def momentum_pv_icir_weighted(prices_df, amount_df, short_window=20, long_window
     参数:
         prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
         amount_df: pd.DataFrame, 成交额数据 (index=日期, columns=行业)
-        short_window: int, 短期窗口，默认20
-        long_window: int, 长期窗口，默认240
+        window: int, 该参数不使用，保留仅为兼容性。因子固定使用短期20天、长期240天
         rebalance_freq: int, 调仓频率，默认20
         lookback_num_for_icir: int or None, 计算ICIR的回溯IC数量
     
     返回:
         pd.DataFrame, 量价清洗ICIR加权动量因子值，值越大动量越强
     """
+    # 固定窗口设置（原文设计：短期20天，长期240天，两者无特定比例关系）
+    short_window = 20
+    long_window = 240
     
     def calc_log_returns(prices):
         """计算对数收益率: r_t = ln(Close_t) - ln(Close_{t-1})"""
@@ -556,32 +558,34 @@ def momentum_pv_icir_weighted(prices_df, amount_df, short_window=20, long_window
     return final_factor
 
 
-def momentum_composite_with_crowding_filter(prices_df, amount_df, lookback_window=240,
-                                             crowding_ma_window=5,
-                                             crowding_threshold_pct=0.15):
+def momentum_rebound_with_crowding_filter(prices_df, amount_df, window=240,
+                                          crowding_ma_window=5,
+                                          crowding_threshold_pct=0.15):
     """
-    综合动量因子 + 拥挤度过滤
+    反弹动量因子（综合动量 + 拥挤度过滤）
     
     出处：20240624-华鑫证券-动量、拥挤度、轮动速率的统一："电风扇"行情下的行业轮动
     
     理念：纯动量策略容易追高过热行业，需用拥挤度过滤规避均值回归风险。
+          反弹动量捕捉"V型反转"信号，结合传统动量形成综合动量。
     构造：
+        - 传统动量：P_t / P_{t-window} - 1（起点到终点的涨幅）
+        - 反弹动量：P_t / min(P_{t-window:t}) - 1（从最低点的反弹幅度）
         - 综合动量：z(传统动量) + z(反弹动量)
-          传统动量 = P_t / P_{t-window} - 1
-          反弹动量 = P_t / min(P_{t-window:t}) - 1
-        - 拥挤度：成交额MA在历史窗口的分位数
-        - 过滤：拥挤度最高的前15%行业设为NaN（黑名单）
+        - 拥挤度过滤：成交额MA在历史窗口的分位数，最高15%进入黑名单
     
     参数:
         prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
         amount_df: pd.DataFrame, 成交额数据 (index=日期, columns=行业)
-        lookback_window: int, 回溯窗口，默认240
+        window: int, 回溯窗口，默认240
         crowding_ma_window: int, 成交额MA窗口，默认5
         crowding_threshold_pct: float, 黑名单阈值，默认0.15
     
     返回:
         pd.DataFrame, 调整后的综合动量因子值，黑名单行业为NaN
     """
+    # 使用统一的window参数
+    lookback_window = window
     
     def zscore_cross_sectional(df):
         """
@@ -817,7 +821,7 @@ def momentum_amplitude_cut(high_df, low_df, prices_df, window=60,
 
 
 def momentum_pure_liquidity_stripped(prices_df, turnover_df, window=20,
-                                      zscore_window=250, smooth_window=3,
+                                      zscore_window=240, smooth_window=3,
                                       min_industries=15):
     """
     剥离流动性提纯动量因子（Liquidity-Stripped Pure Momentum）

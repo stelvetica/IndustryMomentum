@@ -20,22 +20,61 @@ from wind_data_loader import (
 import factor_
 
 # 默认参数
-DEFAULT_REBALANCE_FREQ = 20   # 调仓频率/预测窗口 (天)
+DEFAULT_REBALANCE_FREQ = 20   # 调仓频率/预测窗口 (天) - 仅在非月度调仓时使用
+DEFAULT_MONTHLY_REBALANCE = True  # 默认使用月度调仓（每月最后一个交易日）
 N_LAYERS = 5                  # 分层回测层数
-WINDOWS = [20, 60, 120, 240]  # 多周期回测窗口
+WINDOWS = [20, 60, 120, 240]  # 多周期回测窗口（因子计算的回溯窗口）
+
+# 因子预热期配置（用于计算统一的回测起始日期）
+# 每个因子的预热期 = base_warmup + window * window_multiplier
+# 其中 base_warmup 是固定的预热期，window_multiplier 是窗口的倍数
+# windows: 该因子适用的窗口列表，None 表示使用默认的 WINDOWS
+FACTOR_WARMUP_CONFIG = {
+    # ===== 基础动量因子（只需要 window 天）=====
+    'momentum': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    'momentum_sharpe': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    'momentum_zscore': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    'momentum_rank_zscore': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    'momentum_calmar_ratio': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    
+    # ===== 量价结合因子 =====
+    'momentum_turnover_adj': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    # momentum_pure_liquidity_stripped: 需要 window + zscore_window(240)
+    'momentum_pure_liquidity_stripped': {'base_warmup': 240, 'window_multiplier': 1, 'windows': None},
+    
+    # ===== 复杂因子 =====
+    # momentum_cross_industry_lasso: 需要 window + min_train_samples(10) * rebalance_freq(20) = window + 200
+    'momentum_cross_industry_lasso': {'base_warmup': 200, 'window_multiplier': 1, 'windows': None},
+    # momentum_price_volume_icir: 固定使用20日（短期）和240日（长期），不需要多窗口测试
+    # 原文设计：短期窗口=20天，长期窗口=240天，两者无特定比例关系
+    # 预热期=240天（长期窗口），windows设为[20]仅作为占位符（实际因子内部固定使用20/240）
+    'momentum_price_volume_icir': {'base_warmup': 240, 'window_multiplier': 0, 'windows': [20]},
+    # momentum_rebound_with_crowding_filter: 需要 window（用于动量和拥挤度计算）
+    'momentum_rebound_with_crowding_filter': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    # momentum_amplitude_cut: 需要 max(window, vol_window=20)
+    'momentum_amplitude_cut': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+}
 
 # 因子注册表（模块级别，方便扩展）
 # 新增因子只需在此添加一行
 FACTOR_REGISTRY = {
-    'momentum': factor_.momentum,  # 传统动量因子
-    'momentum_sharpe': factor_.momentum_sharpe,  # 夏普动量因子
-    'momentum_std': factor_.momentum_std,  # 标准化动量因子（Z-score，不排名）
-    'momentum_rank_std': factor_.momentum_rank_std,  # Rank标准化动量因子
-    'momentum_turnover_adj': factor_.momentum_turnover_adj,  # 换手率调整动量因子
-    'momentum_calmar_ratio': factor_.momentum_calmar_ratio,  # Calmar比率因子
+    # ===== 基础动量因子 =====
+    'momentum': factor_.momentum,  # 传统动量因子（区间收益率）
+    'momentum_sharpe': factor_.momentum_sharpe,  # 夏普动量因子（风险调整后的动量）
+    'momentum_zscore': factor_.momentum_zscore,  # 标准化动量因子（横截面Z-score）
+    'momentum_rank_zscore': factor_.momentum_rank_zscore,  # Rank标准化动量因子（排名标准化）
+    'momentum_calmar_ratio': factor_.momentum_calmar_ratio,  # Calmar比率因子（最大回撤调整）
+    
+    # ===== 量价结合因子 =====
+    'momentum_turnover_adj': factor_.momentum_turnover_adj,  # 换手率调整动量因子（量价背离）
     'momentum_pure_liquidity_stripped': factor_.momentum_pure_liquidity_stripped,  # 剥离流动性提纯动量因子
-    'momentum_cross_industry_lasso': factor_.momentum_cross_industry_lasso,  # Lasso因子（计算较慢，按需启用）
-    #'momentum_positive_bubble': factor_.momentum_positive_bubble,  # 正向泡沫行业轮动因子
+    
+    # ===== 复杂因子（计算较慢）=====
+    'momentum_cross_industry_lasso': factor_.momentum_cross_industry_lasso,  # Lasso因子（行业间相关性）
+    'momentum_price_volume_icir': factor_.momentum_price_volume_icir,  # 量价清洗ICIR加权动量（需要amount_df）
+    'momentum_rebound_with_crowding_filter': factor_.momentum_rebound_with_crowding_filter,  # 反弹动量因子（综合动量+拥挤度过滤）
+    'momentum_amplitude_cut': factor_.momentum_amplitude_cut,  # 振幅切割动量（需要high_df, low_df）
+    # 'momentum_positive_bubble': factor_.momentum_positive_bubble,  # 正向泡沫行业轮动因子（周频，逻辑复杂）
 }
 
 class DataContainer:
@@ -43,7 +82,7 @@ class DataContainer:
     数据容器类，统一管理所有数据
     一次性加载所有数据，避免重复读取文件
     """
-    def __init__(self, file_path=DEFAULT_CACHE_FILE, start_date=None, end_date=None):
+    def __init__(self, file_path=DEFAULT_CACHE_FILE, start_date=None, end_date=None, exclude_incomplete_month=True):
         """
         初始化数据容器，加载所有数据
         
@@ -51,9 +90,11 @@ class DataContainer:
         file_path: str, 数据文件路径
         start_date: str, 数据开始日期 (YYYY-MM-DD)
         end_date: str, 数据结束日期 (YYYY-MM-DD)
+        exclude_incomplete_month: bool, 是否排除最后一个不完整的月份（默认True）
         """
         print("正在加载所有数据...")
         self.file_path = file_path
+        self.exclude_incomplete_month = exclude_incomplete_month
         
         # 加载所有数据
         self.prices_df = load_price_df(file_path)
@@ -81,6 +122,14 @@ class DataContainer:
             self.volume_df = self.volume_df[self.volume_df.index <= end_date]
             self.amount_df = self.amount_df[self.amount_df.index <= end_date]
         
+        # 记录原始数据的最后日期
+        self.original_last_date = self.prices_df.index[-1] if len(self.prices_df) > 0 else None
+        self.last_complete_month_end = None
+        
+        # 排除最后一个不完整的月份（用于月度调仓）
+        if exclude_incomplete_month and len(self.prices_df) > 0:
+            self._exclude_incomplete_month()
+        
         print(f"数据加载完成:")
         print(f"  - 价格数据: {self.prices_df.shape}")
         print(f"  - 最高价数据: {self.high_df.shape}")
@@ -88,6 +137,32 @@ class DataContainer:
         print(f"  - 换手率数据: {self.turnover_df.shape}")
         print(f"  - 成交量数据: {self.volume_df.shape}")
         print(f"  - 日期范围: {self.prices_df.index[0].date()} 至 {self.prices_df.index[-1].date()}")
+        
+        if self.last_complete_month_end and self.original_last_date:
+            if self.last_complete_month_end != self.original_last_date:
+                print(f"  - 注意: 原始数据截止到 {self.original_last_date.date()}，已排除不完整月份")
+                print(f"  - 回测数据截止到 {self.last_complete_month_end.date()}（最后一个完整月末）")
+    
+    def _exclude_incomplete_month(self):
+        """
+        排除最后一个不完整的月份
+        """
+        from factors_analysis import get_last_complete_month_end
+        
+        # 获取最后一个完整月份的月末日期
+        self.last_complete_month_end = get_last_complete_month_end(self.prices_df.index)
+        
+        if self.last_complete_month_end is None:
+            print("警告: 无法确定完整月份，使用全部数据")
+            return
+        
+        # 如果最后一个完整月末与数据最后日期相同，说明数据是完整的
+        if self.last_complete_month_end == self.prices_df.index[-1]:
+            return
+        
+        # 截断数据到最后一个完整月末
+        # 注意：这里不截断原始数据，因为因子计算可能需要更多历史数据
+        # 截断操作在回测时进行
 
 
 def get_factor_docstring(factor_name):
@@ -106,6 +181,104 @@ def get_factor_docstring(factor_name):
     func = FACTOR_REGISTRY[factor_name]
     docstring = inspect.getdoc(func)
     return docstring if docstring else "无说明文档"
+
+
+def calculate_factor_warmup_period(factor_name, window):
+    """
+    计算单个因子在指定窗口下的预热期（交易日数）
+    
+    参数:
+    factor_name: str, 因子名称
+    window: int, 因子计算窗口
+    
+    返回:
+    int: 预热期（交易日数）
+    """
+    if factor_name not in FACTOR_WARMUP_CONFIG:
+        # 默认只需要 window 天
+        return window
+    
+    config = FACTOR_WARMUP_CONFIG[factor_name]
+    base_warmup = config.get('base_warmup', 0)
+    window_multiplier = config.get('window_multiplier', 1)
+    
+    return base_warmup + window * window_multiplier
+
+
+def get_factor_windows(factor_name, default_windows=WINDOWS):
+    """
+    获取因子适用的窗口列表
+    
+    参数:
+    factor_name: str, 因子名称
+    default_windows: list, 默认窗口列表
+    
+    返回:
+    list: 该因子适用的窗口列表
+    """
+    if factor_name not in FACTOR_WARMUP_CONFIG:
+        return default_windows
+    
+    config = FACTOR_WARMUP_CONFIG[factor_name]
+    factor_windows = config.get('windows', None)
+    
+    if factor_windows is None:
+        return default_windows
+    
+    return factor_windows
+
+
+def calculate_factor_unified_start_date(data: 'DataContainer', factor_name, windows,
+                                         rebalance_freq=DEFAULT_REBALANCE_FREQ,
+                                         monthly_rebalance=DEFAULT_MONTHLY_REBALANCE):
+    """
+    计算单个因子在所有窗口下的统一回测起始日期
+    
+    选择该因子在所有窗口中预热期最长的那个，然后找到该日期之后的第一个月末作为统一起始日期
+    
+    参数:
+    data: DataContainer, 数据容器
+    factor_name: str, 因子名称
+    windows: list, 窗口列表
+    rebalance_freq: int, 调仓频率
+    monthly_rebalance: bool, 是否按月调仓
+    
+    返回:
+    pd.Timestamp: 该因子的统一回测起始日期（月末日期）
+    """
+    all_dates = data.prices_df.index
+    
+    # 计算该因子在所有窗口下的最大预热期
+    max_warmup = 0
+    max_warmup_window = None
+    
+    for window in windows:
+        warmup = calculate_factor_warmup_period(factor_name, window)
+        if warmup > max_warmup:
+            max_warmup = warmup
+            max_warmup_window = window
+    
+    # 确保有足够的数据
+    if max_warmup >= len(all_dates):
+        raise ValueError(f"因子 {factor_name} 数据不足：需要至少 {max_warmup} 个交易日，但只有 {len(all_dates)} 个")
+    
+    # 找到预热期结束后的第一个日期
+    warmup_end_date = all_dates[max_warmup]
+    
+    if monthly_rebalance:
+        # 找到预热期结束后的第一个月末日期
+        monthly_dates = get_monthly_rebalance_dates(all_dates)
+        # 找到大于等于 warmup_end_date 的第一个月末
+        valid_monthly_dates = monthly_dates[monthly_dates >= warmup_end_date]
+        
+        if len(valid_monthly_dates) == 0:
+            raise ValueError(f"因子 {factor_name} 预热期结束后没有有效的月末日期")
+        
+        unified_start_date = valid_monthly_dates[0]
+    else:
+        unified_start_date = warmup_end_date
+    
+    return unified_start_date, max_warmup, max_warmup_window
 
 
 def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ):
@@ -141,7 +314,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         'window': window,
         'rebalance_freq': rebalance_freq,
         # 其他参数
-        'zscore_window': 250,
+        'zscore_window': 240,
         'smooth_window': 3,
         'min_industries': 15,
         'train_periods': None,
@@ -179,6 +352,132 @@ def calculate_benchmark_returns(prices_df, rebalance_freq):
     return benchmark_returns
 
 
+def get_monthly_rebalance_dates(all_trade_dates):
+    """
+    根据给定的所有交易日期，生成每月最后一个交易日作为调仓日期。
+    
+    参数:
+    all_trade_dates: pd.DatetimeIndex, 所有的交易日期序列
+    
+    返回:
+    pd.DatetimeIndex: 每月最后一个交易日序列
+    """
+    # 确保日期是DatetimeIndex类型
+    if not isinstance(all_trade_dates, pd.DatetimeIndex):
+        all_trade_dates = pd.to_datetime(all_trade_dates)
+
+    # 按照年月分组，取每个月的最后一个日期
+    # 由于all_trade_dates已经是交易日序列，直接取每个月最后一个日期就是该月的最后一个交易日
+    monthly_last_dates = all_trade_dates.to_series().groupby([all_trade_dates.year, all_trade_dates.month]).apply(lambda x: x.iloc[-1])
+    return pd.DatetimeIndex(monthly_last_dates)
+
+
+def get_last_complete_month_end(all_trade_dates):
+    """
+    获取最后一个完整月份的月末日期。
+    
+    判断逻辑：如果数据的最后一个日期不是该月的最后一个交易日，
+    则认为该月不完整，返回上一个月的月末日期。
+    
+    参数:
+    all_trade_dates: pd.DatetimeIndex, 所有的交易日期序列
+    
+    返回:
+    pd.Timestamp: 最后一个完整月份的月末日期
+    """
+    if not isinstance(all_trade_dates, pd.DatetimeIndex):
+        all_trade_dates = pd.to_datetime(all_trade_dates)
+    
+    if len(all_trade_dates) == 0:
+        return None
+    
+    # 获取所有月末日期
+    monthly_ends = get_monthly_rebalance_dates(all_trade_dates)
+    
+    # 数据的最后一个日期
+    last_date = all_trade_dates[-1]
+    
+    # 检查最后一个日期是否是月末
+    # 如果最后一个日期在月末列表中，说明该月是完整的
+    if last_date in monthly_ends.values:
+        return last_date
+    else:
+        # 最后一个月不完整，返回倒数第二个月末（如果存在）
+        # 找到所有小于 last_date 的月末日期
+        complete_month_ends = monthly_ends[monthly_ends < last_date]
+        if len(complete_month_ends) > 0:
+            return complete_month_ends[-1]
+        else:
+            return None
+
+
+def is_month_complete(all_trade_dates, check_date):
+    """
+    检查指定月份是否完整（即该月的最后一个交易日是否在数据中）
+    
+    参数:
+    all_trade_dates: pd.DatetimeIndex, 所有的交易日期序列
+    check_date: pd.Timestamp, 要检查的日期
+    
+    返回:
+    bool: 该月是否完整
+    """
+    if not isinstance(all_trade_dates, pd.DatetimeIndex):
+        all_trade_dates = pd.to_datetime(all_trade_dates)
+    
+    # 获取该月的所有交易日
+    year, month = check_date.year, check_date.month
+    month_dates = all_trade_dates[(all_trade_dates.year == year) & (all_trade_dates.month == month)]
+    
+    if len(month_dates) == 0:
+        return False
+    
+    # 获取该月在数据中的最后一个交易日
+    last_trade_day_in_data = month_dates[-1]
+    
+    # 检查这是否是该月的最后一个交易日
+    # 方法：检查下一个交易日是否在下个月
+    last_date_idx = all_trade_dates.get_loc(last_trade_day_in_data)
+    
+    # 如果是数据的最后一天，需要判断是否是月末
+    if last_date_idx == len(all_trade_dates) - 1:
+        # 检查日期是否接近月末（最后5个自然日内）
+        import calendar
+        _, last_day = calendar.monthrange(year, month)
+        return last_trade_day_in_data.day >= last_day - 5
+    else:
+        # 检查下一个交易日是否在下个月
+        next_trade_day = all_trade_dates[last_date_idx + 1]
+        return next_trade_day.month != month or next_trade_day.year != year
+
+
+def calculate_monthly_forward_returns(prices_df, all_trade_dates):
+    """
+    计算月度未来收益率（从当前月末到下一个月末的收益率）
+    
+    参数:
+    prices_df: pd.DataFrame, 价格数据
+    all_trade_dates: pd.DatetimeIndex, 所有交易日期
+    
+    返回:
+    pd.DataFrame: 月度未来收益率 (index=日期, columns=行业)
+    """
+    # 获取每月最后一个交易日
+    monthly_dates = get_monthly_rebalance_dates(all_trade_dates)
+    
+    # 计算每个月末到下一个月末的收益率
+    forward_returns = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    
+    for i, date in enumerate(monthly_dates[:-1]):
+        next_date = monthly_dates[i + 1]
+        if date in prices_df.index and next_date in prices_df.index:
+            # 计算从当前月末到下一个月末的收益率
+            ret = (prices_df.loc[next_date] / prices_df.loc[date]) - 1
+            forward_returns.loc[date] = ret
+    
+    return forward_returns
+
+
 def calc_rank_ic(factor_series, return_series):
     """
     计算Rank IC (Spearman相关系数)
@@ -201,24 +500,33 @@ def calc_rank_ic(factor_series, return_series):
     return ic
 
 
-def calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, n_layers=N_LAYERS):
+def calculate_ic_ir(factor_df, forward_returns_df, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, unified_start_date=None):
     """
     计算因子的 IC 和 IR
     
     参数:
         factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
         forward_returns_df: pd.DataFrame, 未来收益率 (index=日期, columns=行业)
-        window: int, 回溯窗口（此参数保留用于兼容性，但不再用于调仓日期计算）
-        rebalance_freq: int, 调仓频率（交易日），默认20
-        n_layers: int, 分层数（此参数保留用于兼容性）
+        rebalance_freq: int, 调仓频率（交易日），默认20。如果 monthly_rebalance 为 True，此参数无效。
+        monthly_rebalance: bool, 是否按月调仓，默认为 True (每月最后一个交易日调仓)
+        unified_start_date: pd.Timestamp, 统一的回测起始日期（如果指定，只计算该日期之后的IC）
     
     返回:
         tuple: (ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean)
     """
-    # 获取调仓日期（从第0天开始，每隔rebalance_freq天取一个调仓日）
     all_dates = factor_df.index
-    rebalance_indices = list(range(0, len(all_dates), rebalance_freq))
-    rebalance_dates = all_dates[rebalance_indices]
+    
+    if monthly_rebalance:
+        # 按月调仓
+        rebalance_dates = get_monthly_rebalance_dates(all_dates)
+    else:
+        # 按固定频率调仓
+        rebalance_indices = list(range(0, len(all_dates), rebalance_freq))
+        rebalance_dates = all_dates[rebalance_indices]
+    
+    # 如果指定了统一起始日期，过滤调仓日期
+    if unified_start_date is not None:
+        rebalance_dates = rebalance_dates[rebalance_dates >= unified_start_date]
     
     # 计算每个调仓日的IC
     ic_list = []
@@ -250,19 +558,113 @@ def calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq=DEFAUL
     return ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean
 
 
-def stratified_backtest(factor_df, prices_df, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, n_layers=N_LAYERS):
+def get_latest_month_holdings(factor_df, prices_df, window, n_layers=N_LAYERS, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE):
+    """
+    获取最新月份的分层持仓（包括不完整月份）
+    用于输出最新的选股结果，即使该月份还没有完整的收益数据
+    
+    参数:
+    factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
+    prices_df: pd.DataFrame, 价格数据
+    window: int, 回溯窗口
+    n_layers: int, 分层数
+    monthly_rebalance: bool, 是否按月调仓
+    
+    返回:
+    dict: {layer_idx: {date: [行业列表]}} 最新月份的持仓
+    """
+    all_dates = factor_df.index
+    
+    if not monthly_rebalance:
+        return {}
+    
+    # 获取所有月末日期（包括不完整月份）
+    all_month_ends = get_monthly_rebalance_dates(all_dates)
+    
+    if len(all_month_ends) == 0:
+        return {}
+    
+    # 获取最新的月末日期
+    latest_month_end = all_month_ends[-1]
+    
+    # 确保该日期在因子数据中存在
+    if latest_month_end not in factor_df.index:
+        return {}
+    
+    # 获取该日期的因子值
+    fac = factor_df.loc[latest_month_end]
+    valid_mask = ~fac.isna()
+    fac = fac[valid_mask]
+    
+    if len(fac) < n_layers * 2:
+        return {}
+    
+    # 按因子值排序并分层
+    sorted_assets = fac.sort_values(ascending=True)
+    n_assets = len(sorted_assets)
+    layer_size = n_assets // n_layers
+    
+    latest_holdings = {i: {} for i in range(n_layers)}
+    
+    for layer in range(n_layers):
+        start_idx = layer * layer_size
+        end_idx = start_idx + layer_size if layer < n_layers - 1 else n_assets
+        layer_assets = sorted_assets.index[start_idx:end_idx].tolist()
+        latest_holdings[layer][latest_month_end] = layer_assets
+    
+    return latest_holdings
+
+
+def stratified_backtest(factor_df, prices_df, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, n_layers=N_LAYERS, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, last_complete_month_end=None, unified_start_date=None):
     """
     分层回测：根据因子值将资产分成n层，计算每层的收益率累计净值
     同时返回每期各层选中的行业
+    
+    参数:
+    factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
+    prices_df: pd.DataFrame, 价格数据
+    window: int, 回溯窗口（因子计算的回溯窗口）
+    rebalance_freq: int, 调仓频率（交易日），默认20。如果 monthly_rebalance 为 True，此参数无效。
+    n_layers: int, 分层数
+    monthly_rebalance: bool, 是否按月调仓，默认为 True (每月最后一个交易日调仓)
+    last_complete_month_end: pd.Timestamp, 最后一个完整月份的月末日期（用于排除不完整月份的收益计算）
+    unified_start_date: pd.Timestamp, 统一的回测起始日期（如果指定，从该日期开始回测）
     
     返回:
     tuple: (nav_df, layer_returns, layer_holdings_history)
     """
     daily_returns = prices_df.pct_change()
     
-    valid_dates = factor_df.index[window::rebalance_freq]
-    valid_dates = [d for d in valid_dates if d in prices_df.index]
+    all_dates_factor_df = factor_df.index
+
+    if monthly_rebalance:
+        # 按月调仓，获取所有月末日期
+        rebalance_dates_raw = get_monthly_rebalance_dates(all_dates_factor_df)
+        
+        # 如果指定了统一起始日期，从该日期开始
+        if unified_start_date is not None:
+            rebalance_dates_raw = rebalance_dates_raw[rebalance_dates_raw >= unified_start_date]
+        
+        # 如果指定了最后一个完整月末，排除之后的调仓日期
+        if last_complete_month_end is not None:
+            rebalance_dates_raw = rebalance_dates_raw[rebalance_dates_raw <= last_complete_month_end]
+    else:
+        # 按固定频率调仓
+        # 如果指定了统一起始日期，从该日期开始
+        if unified_start_date is not None:
+            start_idx = all_dates_factor_df.get_loc(unified_start_date) if unified_start_date in all_dates_factor_df else 0
+            effective_start_dates = all_dates_factor_df[start_idx:]
+        else:
+            # 默认从 window 位置开始
+            start_date_idx = min(window, len(all_dates_factor_df) - 1)
+            effective_start_dates = all_dates_factor_df[start_date_idx:]
+        
+        rebalance_indices = list(range(0, len(effective_start_dates), rebalance_freq))
+        rebalance_dates_raw = effective_start_dates[rebalance_indices]
     
+    # 确保调仓日期在 prices_df 中存在
+    valid_dates = [d for d in rebalance_dates_raw if d in prices_df.index]
+
     layer_nav = {i: [1.0] for i in range(n_layers)}
     nav_dates = [valid_dates[0]] if valid_dates else []
     layer_holdings_history = {i: {} for i in range(n_layers)}  # 记录每期每层持仓
@@ -310,14 +712,15 @@ def stratified_backtest(factor_df, prices_df, window, rebalance_freq=DEFAULT_REB
     return nav_df, layer_returns, layer_holdings_history
 
 
-def calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq=DEFAULT_REBALANCE_FREQ):
+def calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE):
     """
     计算超额收益指标
     
     参数:
     nav_df: pd.DataFrame, 各层净值
     benchmark_nav: pd.Series, 基准净值
-    rebalance_freq: int, 调仓频率
+    rebalance_freq: int, 调仓频率（仅在非月度调仓时使用）
+    monthly_rebalance: bool, 是否按月调仓
     
     返回:
     dict: 各层的超额收益指标
@@ -327,7 +730,8 @@ def calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq=DEFAULT_REBAL
     start_date = nav_df.index[0]
     end_date = nav_df.index[-1]
     years = (end_date - start_date).days / 365.25
-    periods_per_year = 252 / rebalance_freq
+    # 月度调仓时，每年约12个调仓周期；否则按固定频率计算
+    periods_per_year = 12 if monthly_rebalance else 252 / rebalance_freq
     
     # 计算基准收益率序列
     benchmark_returns = benchmark_nav.pct_change().dropna()
@@ -436,23 +840,43 @@ def calculate_yearly_returns(nav_df, benchmark_nav, start_year=2017):
     
     # 添加全样本统计
     if len(nav_df) >= 2:
-        total_g5_return = (g5_nav.iloc[-1] / g5_nav.iloc[0] - 1) * 100
-        total_bench_return = (benchmark_nav.iloc[-1] / benchmark_nav.iloc[0] - 1) * 100
-        total_excess_return = total_g5_return - total_bench_return
+        # 寻找大于等于 start_year 的第一个有效日期作为全样本起始日期
+        full_sample_start_date_mask = nav_df.index.year >= start_year
+        if not full_sample_start_date_mask.any():
+            # 如果没有符合条件的年份，则不计算全样本
+            return pd.DataFrame(yearly_data)
+
+        first_valid_date_for_full_sample = nav_df.index[full_sample_start_date_mask][0]
         
-        yearly_data.append({
-            '年份': '全样本',
-            'G5多头收益(%)': round(total_g5_return, 2),
-            '超额收益(%)': round(total_excess_return, 2),
-            '基准收益(%)': round(total_bench_return, 2),
-        })
+        # 确保起始日期在g5_nav和benchmark_nav中存在
+        if first_valid_date_for_full_sample in g5_nav.index and first_valid_date_for_full_sample in benchmark_nav.index:
+            total_g5_return = (g5_nav.iloc[-1] / g5_nav.loc[first_valid_date_for_full_sample] - 1) * 100
+            total_bench_return = (benchmark_nav.iloc[-1] / benchmark_nav.loc[first_valid_date_for_full_sample] - 1) * 100
+            total_excess_return = total_g5_return - total_bench_return
+            
+            yearly_data.append({
+                '年份': '全样本',
+                'G5多头收益(%)': round(total_g5_return, 2),
+                '超额收益(%)': round(total_excess_return, 2),
+                '基准收益(%)': round(total_bench_return, 2),
+            })
+        else:
+            print(f"警告: 无法在全样本计算中找到起始日期 {first_valid_date_for_full_sample} 的对应数据。")
     
     return pd.DataFrame(yearly_data)
 
 
-def analyze_single_factor_window(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ):
+def analyze_single_factor_window(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, unified_start_date=None):
     """
     分析单个因子在单个窗口下的表现
+    
+    参数:
+    factor_name: str, 因子名称
+    data: DataContainer, 数据容器
+    window: int, 因子计算的回溯窗口
+    rebalance_freq: int, 调仓频率（仅在非月度调仓时使用）
+    monthly_rebalance: bool, 是否按月调仓，默认为 True
+    unified_start_date: pd.Timestamp, 统一的回测起始日期（如果指定，所有因子从该日期开始回测）
     
     返回:
     dict: 包含IC/IR、分层指标、持仓等信息
@@ -460,29 +884,56 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     # 计算因子值
     factor_df = compute_factor(factor_name, data, window, rebalance_freq)
     
+    # 获取最后一个完整月末日期（用于排除不完整月份的收益计算）
+    last_complete_month_end = None
+    if monthly_rebalance and hasattr(data, 'last_complete_month_end'):
+        last_complete_month_end = data.last_complete_month_end
+    
     # 计算未来收益率
-    forward_returns_df = data.prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
+    if monthly_rebalance:
+        # 月度调仓：计算从当前月末到下一个月末的收益率
+        forward_returns_df = calculate_monthly_forward_returns(data.prices_df, data.prices_df.index)
+    else:
+        # 固定频率调仓：使用固定周期的未来收益率
+        forward_returns_df = data.prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
     
     # 计算IC/IR（包含IC累积序列）
-    ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean = calculate_ic_ir(factor_df, forward_returns_df, window, rebalance_freq)
+    # 注意：IC计算需要完整的未来收益率，不完整月份的IC会自动被排除（因为forward_returns为NaN）
+    ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean = calculate_ic_ir(
+        factor_df, forward_returns_df, rebalance_freq=rebalance_freq, monthly_rebalance=monthly_rebalance,
+        unified_start_date=unified_start_date
+    )
     
-    # 分层回测
-    nav_df, layer_returns, layer_holdings = stratified_backtest(factor_df, data.prices_df, window, rebalance_freq)
+    # 分层回测（传入最后一个完整月末日期，排除不完整月份的收益计算）
+    nav_df, layer_returns, layer_holdings = stratified_backtest(
+        factor_df, data.prices_df, window, rebalance_freq=rebalance_freq, monthly_rebalance=monthly_rebalance,
+        last_complete_month_end=last_complete_month_end, unified_start_date=unified_start_date
+    )
     
-    # 计算基准净值
-    benchmark_returns = calculate_benchmark_returns(data.prices_df, rebalance_freq)
+    # 获取最新月份的持仓（包括不完整月份，用于输出最新选股结果）
+    if monthly_rebalance:
+        latest_holdings = get_latest_month_holdings(factor_df, data.prices_df, window, N_LAYERS, monthly_rebalance)
+        # 合并最新持仓到 layer_holdings（如果最新月份不在回测持仓中）
+        for layer_idx, holdings in latest_holdings.items():
+            for date, assets in holdings.items():
+                if date not in layer_holdings.get(layer_idx, {}):
+                    if layer_idx not in layer_holdings:
+                        layer_holdings[layer_idx] = {}
+                    layer_holdings[layer_idx][date] = assets
+    
+    # 计算基准净值（等权行业指数）
     # 对齐到调仓日期
     benchmark_nav = pd.Series(index=nav_df.index, dtype=float)
     benchmark_nav.iloc[0] = 1.0
     for i in range(1, len(nav_df.index)):
         prev_date = nav_df.index[i-1]
         curr_date = nav_df.index[i]
-        # 计算期间基准收益
+        # 计算期间基准收益（所有行业等权平均）
         period_ret = (data.prices_df.loc[curr_date] / data.prices_df.loc[prev_date] - 1).mean()
         benchmark_nav.iloc[i] = benchmark_nav.iloc[i-1] * (1 + period_ret)
     
     # 计算超额指标
-    excess_metrics = calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq)
+    excess_metrics = calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq, monthly_rebalance)
     
     # 计算每年收益统计（仅针对G5）
     yearly_returns = calculate_yearly_returns(nav_df, benchmark_nav, start_year=2017)
@@ -502,29 +953,58 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     }
 
 
-def analyze_all_factors(data: DataContainer, windows=WINDOWS, rebalance_freq=DEFAULT_REBALANCE_FREQ):
+def analyze_all_factors(data: DataContainer, windows=WINDOWS, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, use_unified_start_date=True):
     """
     分析所有因子在所有窗口下的表现
     
     参数:
     data: DataContainer, 数据容器
-    windows: list, 窗口列表
-    rebalance_freq: int, 调仓频率
+    windows: list, 窗口列表（因子计算的回溯窗口，作为默认值）
+    rebalance_freq: int, 调仓频率（仅在非月度调仓时使用）
+    monthly_rebalance: bool, 是否按月调仓，默认为 True (每月最后一个交易日调仓)
+    use_unified_start_date: bool, 是否使用统一的回测起始日期，默认为 True
+        - True: 每个因子内部不同窗口使用该因子的最大预热期对应的统一起始日期
+        - False: 每个窗口使用各自的预热期
     
     返回:
     dict: {factor_name: {window: analysis_result}}
     """
     all_results = {}
     
+    # 打印预热期分析
+    if use_unified_start_date:
+        print("\n" + "=" * 60)
+        print("各因子预热期分析（每个因子内部不同窗口使用统一起始日期）")
+        print("=" * 60)
+    
     for factor_name in FACTOR_REGISTRY.keys():
+        # 获取该因子适用的窗口列表
+        factor_windows = get_factor_windows(factor_name, windows)
+        
         print(f"\n正在分析因子: {factor_name}")
+        print(f"  适用窗口: {factor_windows}")
         factor_results = {}
         
-        for window in windows:
+        # 为每个因子单独计算其统一起始日期（使用该因子适用的窗口）
+        factor_unified_start_date = None
+        if use_unified_start_date:
+            try:
+                factor_unified_start_date, max_warmup, max_warmup_window = calculate_factor_unified_start_date(
+                    data, factor_name, factor_windows, rebalance_freq, monthly_rebalance
+                )
+                print(f"  预热期: {max_warmup}天 (来自{max_warmup_window}日窗口)")
+                print(f"  统一起始日期: {factor_unified_start_date.strftime('%Y-%m-%d')}")
+            except Exception as e:
+                print(f"  计算统一起始日期失败: {e}")
+                factor_unified_start_date = None
+        
+        # 只计算该因子适用的窗口
+        for window in factor_windows:
             print(f"  窗口: {window}日...")
             try:
                 result = analyze_single_factor_window(
-                    factor_name, data, window, rebalance_freq
+                    factor_name, data, window, rebalance_freq, monthly_rebalance=monthly_rebalance,
+                    unified_start_date=factor_unified_start_date
                 )
                 factor_results[window] = result
             except Exception as e:
@@ -935,8 +1415,9 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # 配置参数
-    REBALANCE_FREQ = 20  # 调仓频率（天）
-    WINDOWS_TO_TEST = [20, 60, 120, 240]  # 测试窗口
+    MONTHLY_REBALANCE = True  # 使用月度调仓（每月最后一个交易日）
+    REBALANCE_FREQ = 20  # 调仓频率（天）- 仅在 MONTHLY_REBALANCE=False 时使用
+    WINDOWS_TO_TEST = [20, 60, 120, 240]  # 因子计算的回溯窗口
     OUTPUT_FILE = 'factors_analysis_report.xlsx'
 
     # 固定日期范围（设为None使用全部数据，与单因子测试.py保持一致）
@@ -950,12 +1431,19 @@ if __name__ == "__main__":
     # 显示可用因子
     print(f"\n可用因子列表: {list_factors()}")
     
+    # 显示调仓方式
+    if MONTHLY_REBALANCE:
+        print("\n调仓方式: 每月最后一个交易日调仓")
+    else:
+        print(f"\n调仓方式: 每 {REBALANCE_FREQ} 个交易日调仓")
+    
     # 分析所有因子
     print("\n开始分析所有因子...")
     all_results = analyze_all_factors(
         data,
         windows=WINDOWS_TO_TEST,
-        rebalance_freq=REBALANCE_FREQ
+        rebalance_freq=REBALANCE_FREQ,
+        monthly_rebalance=MONTHLY_REBALANCE
     )
     
     # 导出到Excel

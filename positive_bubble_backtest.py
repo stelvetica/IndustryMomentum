@@ -105,7 +105,11 @@ def run_positive_bubble_backtest(prices_df, amount_df,
     weekly_returns = weekly_prices.pct_change()
     
     # 逐周回测
-    for i in range(1, len(common_dates)):
+    total_weeks = len(common_dates)
+    for i in range(1, total_weeks):
+        if (i + 1) % 100 == 0 or i == total_weeks - 1:
+            print(f"    回测进度: {i+1}/{total_weeks} 周 ({((i+1)/total_weeks)*100:.2f}%)")
+
         prev_date = common_dates[i-1]
         curr_date = common_dates[i]
         
@@ -373,24 +377,22 @@ def create_nav_df(strategy_nav, benchmark_nav, excess_nav):
     return nav_df
 
 
-def export_to_excel(backtest_result, output_file='positive_bubble_backtest.xlsx'):
+def export_to_excel(backtest_result, writer, sheet_name='正向泡沫因子回测'):
     """
     将回测结果导出到Excel
     
     参数:
         backtest_result: dict, 回测结果
-        output_file: str, 输出文件名
+        writer: pd.ExcelWriter, Excel写入器对象
+        sheet_name: str, 要写入的sheet名称
     """
-    print(f"\n正在导出回测结果到: {output_file}")
+    print(f"\n正在导出回测结果到: {writer.path} 的 [{sheet_name}] sheet页")
     
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        
-        # ========== Sheet 1: 策略概览 ==========
-        sheet_name = '策略概览'
-        start_row = 0
-        
-        # 因子说明
-        factor_doc = """
+    # ========== Sheet 1: 策略概览 ==========
+    start_row = 0
+    
+    # 因子说明
+    factor_doc = """
 正向泡沫行业轮动因子（momentum_positive_bubble）
 
 出处：兴业证券《如何结合行业轮动的长短信号？》
@@ -410,51 +412,51 @@ def export_to_excel(backtest_result, output_file='positive_bubble_backtest.xlsx'
     - 周频调仓（每周五）
     - 信号=1表示持有，信号=0表示不持有
 """
-        doc_df = pd.DataFrame({'【因子说明】': [factor_doc]})
-        doc_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
-        start_row += 20
-        
-        # 绩效指标
-        metrics = backtest_result['performance_metrics']
-        metrics_df = pd.DataFrame([metrics]).T
-        metrics_df.columns = ['数值']
-        metrics_df.index.name = '指标'
-        
-        header_df = pd.DataFrame({'【绩效指标】': ['']})
+    doc_df = pd.DataFrame({'【因子说明】': [factor_doc]})
+    doc_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+    start_row += 20
+    
+    # 绩效指标
+    metrics = backtest_result['performance_metrics']
+    metrics_df = pd.DataFrame([metrics]).T
+    metrics_df.columns = ['数值']
+    metrics_df.index.name = '指标'
+    
+    header_df = pd.DataFrame({'【绩效指标】': ['']})
+    header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+    start_row += 1
+    metrics_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
+    start_row += len(metrics_df) + 3
+    
+    # 每年收益统计
+    yearly_df = backtest_result['yearly_returns']
+    if not yearly_df.empty:
+        header_df = pd.DataFrame({'【每年收益统计】': ['']})
         header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
         start_row += 1
-        metrics_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
-        start_row += len(metrics_df) + 3
-        
-        # 每年收益统计
-        yearly_df = backtest_result['yearly_returns']
-        if not yearly_df.empty:
-            header_df = pd.DataFrame({'【每年收益统计】': ['']})
-            header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
-            start_row += 1
-            yearly_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
-            start_row += len(yearly_df) + 3
-        
-        # ========== Sheet 2: 净值序列 ==========
-        nav_df = create_nav_df(
-            backtest_result['strategy_nav'],
-            backtest_result['benchmark_nav'],
-            backtest_result['excess_nav']
-        )
-        nav_df.to_excel(writer, sheet_name='净值序列', index=True)
-        
-        # ========== Sheet 3: 历史持仓 ==========
-        holdings_df = create_holdings_df(backtest_result['holdings_history'])
-        holdings_df.to_excel(writer, sheet_name='历史持仓', index=False)
-        
-        # ========== Sheet 4: 原始信号 ==========
-        signal_df = backtest_result['signal_df'].copy()
-        # 清理列名
-        signal_df.columns = [clean_industry_name(col) for col in signal_df.columns]
-        # 格式化日期索引
-        signal_df.index = signal_df.index.strftime('%Y-%m-%d')
-        signal_df.index.name = '日期'
-        signal_df.to_excel(writer, sheet_name='原始信号', index=True)
+        yearly_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+        start_row += len(yearly_df) + 3
+    
+    # ========== Sheet 2: 净值序列 ==========
+    nav_df = create_nav_df(
+        backtest_result['strategy_nav'],
+        backtest_result['benchmark_nav'],
+        backtest_result['excess_nav']
+    )
+    nav_df.to_excel(writer, sheet_name='净值序列', index=True)
+    
+    # ========== Sheet 3: 历史持仓 ==========
+    holdings_df = create_holdings_df(backtest_result['holdings_history'])
+    holdings_df.to_excel(writer, sheet_name='历史持仓', index=False)
+    
+    # ========== Sheet 4: 原始信号 ==========
+    signal_df = backtest_result['signal_df'].copy()
+    # 清理列名
+    signal_df.columns = [clean_industry_name(col) for col in signal_df.columns]
+    # 格式化日期索引
+    signal_df.index = signal_df.index.strftime('%Y-%m-%d')
+    signal_df.index.name = '日期'
+    signal_df.to_excel(writer, sheet_name='原始信号', index=True)
     
     print(f"导出完成！")
 
@@ -504,11 +506,14 @@ def main():
     print(backtest_result['yearly_returns'].to_string(index=False))
     
     # 导出到Excel
-    output_file = 'positive_bubble_backtest.xlsx'
-    export_to_excel(backtest_result, output_file)
+    output_file = 'factors_analysis_report.xlsx'
+    sheet_name = '正向泡沫因子回测'
+    
+    with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+        export_to_excel(backtest_result, writer, sheet_name)
     
     print("\n" + "=" * 60)
-    print(f"回测完成！结果已保存至: {output_file}")
+    print(f"回测完成！结果已保存至: {output_file} 的 [{sheet_name}] sheet页")
     print("=" * 60)
 
 
