@@ -204,117 +204,10 @@ def momentum_turnover_adj(prices_df, turnover_df, window):
     return momentum_turnover_adj
 
 
-def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_periods=36, benchmark_returns=None):
-    """
-    行业间相关性动量因子（基于Lasso回归的领先滞后关系）
-    
-    出处：20221201-东方证券-《量化策略研究之六》：行业动量的刻画
-    
-    理念：利用行业间经济联系（上下游、替代品、宏观周期）预测目标行业未来表现。
-          Lasso的L1正则化自动筛选有预测力的行业，避免过拟合。
-    构造：用各行业历史超额收益作为特征，Lasso回归预测目标行业未来超额收益。
-    
-    参数:
-        prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
-        window: int, 回溯窗口（交易日），常用20/60
-        rebalance_freq: int, 调仓频率（交易日），常用20
-        train_periods: int, 训练样本数量（调仓周期数），默认36
-        benchmark_returns: pd.Series or None, 基准收益率序列，默认等权平均
-    
-    返回:
-        pd.DataFrame, 预测的未来超额收益，值越大预测表现越好
-    """
-    # 使用上下文管理器局部抑制警告，避免影响全局设置
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        
-        lookback_returns = prices_df.pct_change(window)
-        forward_returns = prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
-        
-        if benchmark_returns is None:
-            lookback_benchmark = lookback_returns.mean(axis=1)
-            forward_benchmark = forward_returns.mean(axis=1)
-        else:
-            lookback_benchmark = benchmark_returns.rolling(window).apply(
-                lambda x: (1 + x).prod() - 1, raw=True
-            )
-            forward_benchmark = benchmark_returns.rolling(rebalance_freq).apply(
-                lambda x: (1 + x).prod() - 1, raw=True
-            ).shift(-rebalance_freq)
-        
-        excess_lookback = lookback_returns.sub(lookback_benchmark, axis=0)
-        excess_forward = forward_returns.sub(forward_benchmark, axis=0)
-        
-        industries = prices_df.columns.tolist()
-        dates = prices_df.index.tolist()
-        predictions = pd.DataFrame(index=prices_df.index, columns=industries, dtype=float)
-        
-        min_train_samples = 10
-        min_start = window + min_train_samples * rebalance_freq
-        prediction_dates = list(range(min_start, len(dates), rebalance_freq))
-        
-        for t_idx in prediction_dates:
-            if t_idx >= len(dates):
-                break
-                
-            current_date = dates[t_idx]
-            X_train_list = []
-            y_train_dict = {ind: [] for ind in industries}
-            
-            sample_indices = list(range(window, t_idx - rebalance_freq, rebalance_freq))
-            
-            if train_periods is not None and len(sample_indices) > train_periods:
-                sample_indices = sample_indices[-train_periods:]
-            
-            for sample_idx in sample_indices:
-                X_row = excess_lookback.iloc[sample_idx].values
-                y_idx = sample_idx + rebalance_freq
-                if y_idx >= len(dates):
-                    continue
-                    
-                if not np.any(np.isnan(X_row)):
-                    X_train_list.append(X_row)
-                    for ind in industries:
-                        y_val = excess_forward.iloc[sample_idx]
-                        if ind in y_val.index:
-                            y_train_dict[ind].append(y_val[ind])
-                        else:
-                            y_train_dict[ind].append(np.nan)
-            
-            if len(X_train_list) < 10:
-                continue
-                
-            X_train = np.array(X_train_list)
-            X_current = excess_lookback.iloc[t_idx].values.reshape(1, -1)
-            
-            if np.any(np.isnan(X_current)):
-                continue
-            
-            for ind in industries:
-                y_train = np.array(y_train_dict[ind])
-                valid_mask = ~np.isnan(y_train)
-                if valid_mask.sum() < 10:
-                    continue
-                
-                X_valid = X_train[valid_mask]
-                y_valid = y_train[valid_mask]
-                
-                try:
-                    lasso = LassoLarsIC(criterion='aic')
-                    lasso.fit(X_valid, y_valid)
-                    pred = lasso.predict(X_current)[0]
-                    predictions.loc[current_date, ind] = pred
-                except Exception:
-                    predictions.loc[current_date, ind] = y_valid.mean()
-        
-        predictions = predictions.ffill()
-        return predictions
-
-
 def momentum_price_volume_icir(prices_df, amount_df, window=20,
                                 rebalance_freq=20, lookback_num_for_icir=None):
     """
-    量价清洗ICIR加权动量因子（多维度改进的复合动量）
+    量价清洗ICIR加权动量因子
     
     出处：20220406-长江证券-行业轮动系列(五)：动量篇
     
@@ -941,6 +834,113 @@ def momentum_pure_liquidity_stripped(prices_df, turnover_df, window=20,
     return pure_momentum_factor
 
 
+def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_periods=36, benchmark_returns=None):
+    """
+    行业间相关性动量因子（基于Lasso回归的领先滞后关系）
+    
+    出处：20221201-东方证券-《量化策略研究之六》：行业动量的刻画
+    
+    理念：利用行业间经济联系（上下游、替代品、宏观周期）预测目标行业未来表现。
+          Lasso的L1正则化自动筛选有预测力的行业，避免过拟合。
+    构造：用各行业历史超额收益作为特征，Lasso回归预测目标行业未来超额收益。
+    
+    参数:
+        prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
+        window: int, 回溯窗口（交易日），常用20/60
+        rebalance_freq: int, 调仓频率（交易日），常用20
+        train_periods: int, 训练样本数量（调仓周期数），默认36
+        benchmark_returns: pd.Series or None, 基准收益率序列，默认等权平均
+    
+    返回:
+        pd.DataFrame, 预测的未来超额收益，值越大预测表现越好
+    """
+    # 使用上下文管理器局部抑制警告，避免影响全局设置
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        
+        lookback_returns = prices_df.pct_change(window)
+        forward_returns = prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
+        
+        if benchmark_returns is None:
+            lookback_benchmark = lookback_returns.mean(axis=1)
+            forward_benchmark = forward_returns.mean(axis=1)
+        else:
+            lookback_benchmark = benchmark_returns.rolling(window).apply(
+                lambda x: (1 + x).prod() - 1, raw=True
+            )
+            forward_benchmark = benchmark_returns.rolling(rebalance_freq).apply(
+                lambda x: (1 + x).prod() - 1, raw=True
+            ).shift(-rebalance_freq)
+        
+        excess_lookback = lookback_returns.sub(lookback_benchmark, axis=0)
+        excess_forward = forward_returns.sub(forward_benchmark, axis=0)
+        
+        industries = prices_df.columns.tolist()
+        dates = prices_df.index.tolist()
+        predictions = pd.DataFrame(index=prices_df.index, columns=industries, dtype=float)
+        
+        min_train_samples = 10
+        min_start = window + min_train_samples * rebalance_freq
+        prediction_dates = list(range(min_start, len(dates), rebalance_freq))
+        
+        for t_idx in prediction_dates:
+            if t_idx >= len(dates):
+                break
+                
+            current_date = dates[t_idx]
+            X_train_list = []
+            y_train_dict = {ind: [] for ind in industries}
+            
+            sample_indices = list(range(window, t_idx - rebalance_freq, rebalance_freq))
+            
+            if train_periods is not None and len(sample_indices) > train_periods:
+                sample_indices = sample_indices[-train_periods:]
+            
+            for sample_idx in sample_indices:
+                X_row = excess_lookback.iloc[sample_idx].values
+                y_idx = sample_idx + rebalance_freq
+                if y_idx >= len(dates):
+                    continue
+                    
+                if not np.any(np.isnan(X_row)):
+                    X_train_list.append(X_row)
+                    for ind in industries:
+                        y_val = excess_forward.iloc[sample_idx]
+                        if ind in y_val.index:
+                            y_train_dict[ind].append(y_val[ind])
+                        else:
+                            y_train_dict[ind].append(np.nan)
+            
+            if len(X_train_list) < 10:
+                continue
+                
+            X_train = np.array(X_train_list)
+            X_current = excess_lookback.iloc[t_idx].values.reshape(1, -1)
+            
+            if np.any(np.isnan(X_current)):
+                continue
+            
+            for ind in industries:
+                y_train = np.array(y_train_dict[ind])
+                valid_mask = ~np.isnan(y_train)
+                if valid_mask.sum() < 10:
+                    continue
+                
+                X_valid = X_train[valid_mask]
+                y_valid = y_train[valid_mask]
+                
+                try:
+                    lasso = LassoLarsIC(criterion='aic')
+                    lasso.fit(X_valid, y_valid)
+                    pred = lasso.predict(X_current)[0]
+                    predictions.loc[current_date, ind] = pred
+                except Exception:
+                    predictions.loc[current_date, ind] = y_valid.mean()
+        
+        predictions = predictions.ffill()
+        return predictions
+
+
 # ============================================================================
 # 兴业证券"正向泡沫"行业轮动因子
 # 出处：《如何结合行业轮动的长短信号？》
@@ -1087,6 +1087,8 @@ class GaussianBOCD:
         self.kappa_params = [self.kappa0]
         self.alpha_params = [self.alpha0]
         self.beta_params = [self.beta0]
+
+
 def momentum_positive_bubble(prices_df, amount_df,
                               bsadf_min_window=62,
                               bsadf_compare_window=40,
