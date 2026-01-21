@@ -10,12 +10,16 @@ import pandas as pd
 import numpy as np
 import inspect
 from scipy import stats
+from copy import copy
 
 # 导入数据加载模块和因子模块
-import wind_data_loader
-from wind_data_loader import (
+import data_loader
+from data_loader import (
     load_price_df, load_high_df, load_low_df,
-    load_turnover_df, load_volume_df, DEFAULT_CACHE_FILE
+    load_turnover_df, load_volume_df, DEFAULT_CACHE_FILE,
+    load_constituent_df, load_stock_price_df, load_stock_mv_df, load_industry_code_df,
+    load_barra_factor_returns,
+    DEFAULT_CONSTITUENT_FILE, DEFAULT_STOCK_PRICE_FILE, DEFAULT_STOCK_MV_FILE, DEFAULT_INDUSTRY_CODE_FILE
 )
 import factor_
 
@@ -25,56 +29,156 @@ DEFAULT_MONTHLY_REBALANCE = True  # 默认使用月度调仓（每月最后一�
 N_LAYERS = 5                  # 分层回测层数
 WINDOWS = [20, 60, 120, 240]  # 多周期回测窗口（因子计算的回溯窗口）
 
-# 因子预热期配置（用于计算统一的回测起始日期）
-# 每个因子的预热期 = base_warmup + window * window_multiplier
-# 其中 base_warmup 是固定的预热期，window_multiplier 是窗口的倍数
-# windows: 该因子适用的窗口列表，None 表示使用默认的 WINDOWS
-FACTOR_WARMUP_CONFIG = {
+# 统一因子配置表
+# 每个因子包含：
+#   - func: 因子计算函数
+#   - base_warmup: 固定预热期（交易日）
+#   - window_multiplier: 窗口倍数，预热期 = base_warmup + window * window_multiplier
+#   - windows: 该因子适用的窗口列表，None 表示使用默认的 WINDOWS
+#   - requires_constituent: 是否需要成分股数据
+#
+# 按照 factor_.py 中的定义顺序排列
+FACTOR_CONFIG = {
     # ===== 基础动量因子（只需要 window 天）=====
-    'momentum': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    'momentum_sharpe': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    'momentum_zscore': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    'momentum_rank_zscore': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    'momentum_calmar_ratio': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    'momentum': {
+        'func': factor_.momentum,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '传统动量因子（区间收益率）'
+    },
+    'momentum_zscore': {
+        'func': factor_.momentum_zscore,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '标准化动量因子（横截面Z-score）'
+    },
+    'momentum_sharpe': {
+        'func': factor_.momentum_sharpe,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '夏普动量因子（风险调整后的动量）'
+    },
+    'momentum_calmar_ratio': {
+        'func': factor_.momentum_calmar_ratio,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': 'Calmar比率因子（最大回撤调整）'
+    },
+    'momentum_rank_zscore': {
+        'func': factor_.momentum_rank_zscore,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': 'Rank标准化动量因子（排名标准化）'
+    },
     
-    # ===== 量价结合因子 =====
-    'momentum_turnover_adj': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    # momentum_pure_liquidity_stripped: 需要 window + zscore_window(240)
-    'momentum_pure_liquidity_stripped': {'base_warmup': 240, 'window_multiplier': 1, 'windows': None},
+    # ===== 平稳动量因子 =====
+    'momentum_turnover_adj': {
+        'func': factor_.momentum_turnover_adj,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '换手率调整动量因子（量价背离）'
+    },
+    'momentum_price_volume_icir': {
+        'func': factor_.momentum_price_volume_icir,
+        'base_warmup': 240,
+        'window_multiplier': 0,
+        'windows': [20],
+        'requires_constituent': False,
+        'description': '量价清洗ICIR加权动量（需要amount_df）'
+    },
+    'momentum_rebound_with_crowding_filter': {
+        'func': factor_.momentum_rebound_with_crowding_filter,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '反弹动量因子（综合动量+拥挤度过滤）'
+    },
+    'momentum_amplitude_cut': {
+        'func': factor_.momentum_amplitude_cut,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '振幅切割动量（需要high_df, low_df）'
+    },
     
-    # ===== 复杂因子 =====
-    # momentum_cross_industry_lasso: 需要 window + min_train_samples(10) * rebalance_freq(20) = window + 200
-    'momentum_cross_industry_lasso': {'base_warmup': 200, 'window_multiplier': 1, 'windows': None},
-    # momentum_price_volume_icir: 固定使用20日（短期）和240日（长期），不需要多窗口测试
-    # 原文设计：短期窗口=20天，长期窗口=240天，两者无特定比例关系
-    # 预热期=240天（长期窗口），windows设为[20]仅作为占位符（实际因子内部固定使用20/240）
-    'momentum_price_volume_icir': {'base_warmup': 240, 'window_multiplier': 0, 'windows': [20]},
-    # momentum_rebound_with_crowding_filter: 需要 window（用于动量和拥挤度计算）
-    'momentum_rebound_with_crowding_filter': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
-    # momentum_amplitude_cut: 需要 max(window, vol_window=20)
-    'momentum_amplitude_cut': {'base_warmup': 0, 'window_multiplier': 1, 'windows': None},
+    # ===== 特质收益动量因子 =====
+    'momentum_pure_liquidity_stripped': {
+        'func': factor_.momentum_pure_liquidity_stripped,
+        'base_warmup': 240,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '剥离流动性提纯动量因子'
+    },
+    'momentum_residual': {
+        'func': factor_.momentum_residual,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': '行业残差动量因子（需要Barra因子数据）'
+    },
+    
+    # ===== 行业间相关性动量因子 =====
+    'momentum_cross_industry_lasso': {
+        'func': factor_.momentum_cross_industry_lasso,
+        'base_warmup': 200,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': False,
+        'description': 'Lasso因子（行业间相关性）'
+    },
+    
+    # ===== 行业内关系动量因子（需要成分股数据）=====
+    'momentum_industry_component': {
+        'func': factor_.momentum_industry_component,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': [240],
+        'requires_constituent': True,
+        'description': '行业成分股动量因子（一致性上涨）'
+    },
+    'momentum_pca': {
+        'func': factor_.momentum_pca,
+        'base_warmup': 60,
+        'window_multiplier': 1,
+        'windows': [20],
+        'requires_constituent': True,
+        'description': 'PcaMom技术面内生动量因子'
+    },
+    'momentum_lead_lag_enhanced': {
+        'func': factor_.momentum_lead_lag_enhanced,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'windows': None,
+        'requires_constituent': True,
+        'description': '龙头领先特征修正后的动量增强因子'
+    },
 }
 
-# 因子注册表（模块级别，方便扩展）
-# 新增因子只需在此添加一行
-FACTOR_REGISTRY = {
-    # ===== 基础动量因子 =====
-    'momentum': factor_.momentum,  # 传统动量因子（区间收益率）
-    'momentum_sharpe': factor_.momentum_sharpe,  # 夏普动量因子（风险调整后的动量）
-    'momentum_zscore': factor_.momentum_zscore,  # 标准化动量因子（横截面Z-score）
-    'momentum_rank_zscore': factor_.momentum_rank_zscore,  # Rank标准化动量因子（排名标准化）
-    'momentum_calmar_ratio': factor_.momentum_calmar_ratio,  # Calmar比率因子（最大回撤调整）
-    
-    # ===== 量价结合因子 =====
-    'momentum_turnover_adj': factor_.momentum_turnover_adj,  # 换手率调整动量因子（量价背离）
-    'momentum_pure_liquidity_stripped': factor_.momentum_pure_liquidity_stripped,  # 剥离流动性提纯动量因子
-    
-    # ===== 复杂因子（计算较慢）=====
-    'momentum_cross_industry_lasso': factor_.momentum_cross_industry_lasso,  # Lasso因子（行业间相关性）
-    'momentum_price_volume_icir': factor_.momentum_price_volume_icir,  # 量价清洗ICIR加权动量（需要amount_df）
-    'momentum_rebound_with_crowding_filter': factor_.momentum_rebound_with_crowding_filter,  # 反弹动量因子（综合动量+拥挤度过滤）
-    'momentum_amplitude_cut': factor_.momentum_amplitude_cut,  # 振幅切割动量（需要high_df, low_df）
-    # 'momentum_positive_bubble': factor_.momentum_positive_bubble,  # 正向泡沫行业轮动因子（周频，逻辑复杂）
+# 兼容性：保留 FACTOR_REGISTRY 和 FACTOR_WARMUP_CONFIG 作为视图
+FACTOR_REGISTRY = {name: config['func'] for name, config in FACTOR_CONFIG.items()}
+FACTOR_WARMUP_CONFIG = {
+    name: {
+        'base_warmup': config['base_warmup'],
+        'window_multiplier': config['window_multiplier'],
+        'windows': config['windows']
+    }
+    for name, config in FACTOR_CONFIG.items()
 }
 
 class DataContainer:
@@ -82,7 +186,8 @@ class DataContainer:
     数据容器类，统一管理所有数据
     一次性加载所有数据，避免重复读取文件
     """
-    def __init__(self, file_path=DEFAULT_CACHE_FILE, start_date=None, end_date=None, exclude_incomplete_month=True):
+    def __init__(self, file_path=DEFAULT_CACHE_FILE, start_date=None, end_date=None, 
+                 exclude_incomplete_month=True, load_constituent=False):
         """
         初始化数据容器，加载所有数据
         
@@ -91,12 +196,14 @@ class DataContainer:
         start_date: str, 数据开始日期 (YYYY-MM-DD)
         end_date: str, 数据结束日期 (YYYY-MM-DD)
         exclude_incomplete_month: bool, 是否排除最后一个不完整的月份（默认True）
+        load_constituent: bool, 是否加载成分股数据（默认False，需要时设为True）
         """
         print("正在加载所有数据...")
         self.file_path = file_path
         self.exclude_incomplete_month = exclude_incomplete_month
+        self.load_constituent = load_constituent
         
-        # 加载所有数据
+        # 加载行业指数数据
         self.prices_df = load_price_df(file_path)
         self.high_df = load_high_df(file_path)
         self.low_df = load_low_df(file_path)
@@ -106,6 +213,22 @@ class DataContainer:
         # amount_df 使用 volume_df 作为代理（成交量可近似代表成交额趋势）
         self.amount_df = self.volume_df
 
+        # 成分股相关数据（按需加载）
+        self.constituent_df = None
+        self.stock_price_df = None
+        self.stock_mv_df = None
+        self.industry_code_df = None
+
+        # Barra因子数据（用于残差动量因子）
+        try:
+            self.barra_factor_returns_df = load_barra_factor_returns()
+        except FileNotFoundError:
+            self.barra_factor_returns_df = None
+            print("  - 警告: Barra因子数据文件不存在，momentum_residual因子将不可用")
+
+        if load_constituent:
+            self._load_constituent_data()
+
         # 根据日期范围筛选数据
         if start_date:
             self.prices_df = self.prices_df[self.prices_df.index >= start_date]
@@ -114,6 +237,14 @@ class DataContainer:
             self.turnover_df = self.turnover_df[self.turnover_df.index >= start_date]
             self.volume_df = self.volume_df[self.volume_df.index >= start_date]
             self.amount_df = self.amount_df[self.amount_df.index >= start_date]
+            # 成分股数据也需要筛选
+            if self.stock_price_df is not None:
+                self.stock_price_df = self.stock_price_df[self.stock_price_df.index >= start_date]
+            if self.stock_mv_df is not None:
+                self.stock_mv_df = self.stock_mv_df[self.stock_mv_df.index >= start_date]
+            # Barra因子数据筛选
+            if self.barra_factor_returns_df is not None:
+                self.barra_factor_returns_df = self.barra_factor_returns_df[self.barra_factor_returns_df.index >= start_date]
         if end_date:
             self.prices_df = self.prices_df[self.prices_df.index <= end_date]
             self.high_df = self.high_df[self.high_df.index <= end_date]
@@ -121,6 +252,13 @@ class DataContainer:
             self.turnover_df = self.turnover_df[self.turnover_df.index <= end_date]
             self.volume_df = self.volume_df[self.volume_df.index <= end_date]
             self.amount_df = self.amount_df[self.amount_df.index <= end_date]
+            if self.stock_price_df is not None:
+                self.stock_price_df = self.stock_price_df[self.stock_price_df.index <= end_date]
+            if self.stock_mv_df is not None:
+                self.stock_mv_df = self.stock_mv_df[self.stock_mv_df.index <= end_date]
+            # Barra因子数据筛选
+            if self.barra_factor_returns_df is not None:
+                self.barra_factor_returns_df = self.barra_factor_returns_df[self.barra_factor_returns_df.index <= end_date]
         
         # 记录原始数据的最后日期
         self.original_last_date = self.prices_df.index[-1] if len(self.prices_df) > 0 else None
@@ -138,10 +276,40 @@ class DataContainer:
         print(f"  - 成交量数据: {self.volume_df.shape}")
         print(f"  - 日期范围: {self.prices_df.index[0].date()} 至 {self.prices_df.index[-1].date()}")
         
+        if load_constituent:
+            print(f"  - 成分股数据: 已加载")
+            if self.stock_price_df is not None:
+                print(f"    - 个股价格: {self.stock_price_df.shape}")
+            if self.stock_mv_df is not None:
+                print(f"    - 个股市值: {self.stock_mv_df.shape}")
+        
         if self.last_complete_month_end and self.original_last_date:
             if self.last_complete_month_end != self.original_last_date:
                 print(f"  - 注意: 原始数据截止到 {self.original_last_date.date()}，已排除不完整月份")
                 print(f"  - 回测数据截止到 {self.last_complete_month_end.date()}（最后一个完整月末）")
+    
+    def _load_constituent_data(self):
+        """
+        加载成分股相关数据
+        """
+        print("  正在加载成分股数据...")
+        try:
+            self.constituent_df = load_constituent_df()
+            self.stock_price_df = load_stock_price_df()
+            self.stock_mv_df = load_stock_mv_df()
+            self.industry_code_df = load_industry_code_df()
+        except FileNotFoundError as e:
+            print(f"  警告: 成分股数据加载失败 - {e}")
+            print(f"  需要成分股数据的因子将无法计算")
+    
+    def has_constituent_data(self):
+        """
+        检查是否已加载成分股数据
+        """
+        return (self.constituent_df is not None and 
+                self.stock_price_df is not None and 
+                self.stock_mv_df is not None and 
+                self.industry_code_df is not None)
     
     def _exclude_incomplete_month(self):
         """
@@ -175,12 +343,46 @@ def get_factor_docstring(factor_name):
     返回:
     str: 因子说明文档
     """
-    if factor_name not in FACTOR_REGISTRY:
+    if factor_name not in FACTOR_CONFIG:
         return "未找到因子说明"
     
-    func = FACTOR_REGISTRY[factor_name]
+    func = FACTOR_CONFIG[factor_name]['func']
     docstring = inspect.getdoc(func)
     return docstring if docstring else "无说明文档"
+
+
+def get_factor_config(factor_name):
+    """
+    获取因子的完整配置信息
+    
+    参数:
+    factor_name: str, 因子名称
+    
+    返回:
+    dict: 因子配置，包含 func, base_warmup, window_multiplier, windows, requires_constituent, description
+    """
+    if factor_name not in FACTOR_CONFIG:
+        return None
+    return FACTOR_CONFIG[factor_name]
+
+
+def print_factor_config_summary():
+    """
+    打印因子配置摘要
+    """
+    print("=" * 80)
+    print("因子配置摘要")
+    print("=" * 80)
+    print(f"{'因子名称':<40} {'需要成分股':<12} {'预热期配置':<20}")
+    print("-" * 80)
+    for name, config in FACTOR_CONFIG.items():
+        requires = "是" if config.get('requires_constituent', False) else "否"
+        warmup_info = f"base={config['base_warmup']}, mult={config['window_multiplier']}"
+        print(f"{name:<40} {requires:<12} {warmup_info:<20}")
+    print("=" * 80)
+    print(f"总计: {len(FACTOR_CONFIG)} 个因子")
+    constituent_count = sum(1 for c in FACTOR_CONFIG.values() if c.get('requires_constituent', False))
+    print(f"需要成分股数据的因子: {constituent_count} 个")
 
 
 def calculate_factor_warmup_period(factor_name, window):
@@ -297,10 +499,22 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
     if factor_name not in FACTOR_REGISTRY:
         raise ValueError(f"未知因子名称: {factor_name}. 可选: {list(FACTOR_REGISTRY.keys())}")
     
+    # 检查是否需要成分股数据
+    factor_config = FACTOR_CONFIG.get(factor_name, {})
+    if factor_config.get('requires_constituent', False) and not data.has_constituent_data():
+        raise ValueError(f"因子 '{factor_name}' 需要成分股数据，但 DataContainer 未加载成分股数据。"
+                        f"请使用 DataContainer(load_constituent=True) 初始化。")
+    
     factor_func = FACTOR_REGISTRY[factor_name]
     sig = inspect.signature(factor_func)
     param_names = list(sig.parameters.keys())
     
+    # 计算基准收益率（用于需要的因子）
+    benchmark_returns = calculate_benchmark_returns(data.prices_df, rebalance_freq)
+
+    # 计算行业日收益率（用于残差动量因子）
+    industry_returns_df = data.prices_df.pct_change()
+
     # 构建参数字典 - 包含所有可能需要的参数
     available_params = {
         # 数据参数
@@ -310,6 +524,12 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         'turnover_df': data.turnover_df,
         'volume_df': data.volume_df,
         'amount_df': data.amount_df,  # 使用volume_df作为代理
+        # 成分股数据参数
+        'constituent_df': data.constituent_df,
+        'stock_price_df': data.stock_price_df,
+        'stock_mv_df': data.stock_mv_df,
+        'industry_code_df': data.industry_code_df,
+        'industry_code_file': DEFAULT_INDUSTRY_CODE_FILE,
         # 窗口参数（所有因子统一使用 window）
         'window': window,
         'rebalance_freq': rebalance_freq,
@@ -318,7 +538,13 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         'smooth_window': 3,
         'min_industries': 15,
         'train_periods': None,
-        'benchmark_returns': None,
+        'benchmark_returns': benchmark_returns,
+        # PCA因子参数
+        'pca_window': 60,
+        'lag': 20,
+        # 残差动量因子参数
+        'industry_returns_df': industry_returns_df,
+        'barra_factor_returns_df': data.barra_factor_returns_df,
     }
     
     # 根据函数签名自动选择参数
@@ -1016,6 +1242,103 @@ def analyze_all_factors(data: DataContainer, windows=WINDOWS, rebalance_freq=DEF
     return all_results
 
 
+def find_best_windows(factor_results, top_n=2):
+    """
+    找到IC和ICIR最大的窗口
+
+    参数:
+    factor_results: dict, {window: analysis_result} 单个因子的所有窗口结果
+    top_n: int, 返回前N个最优窗口，默认2
+
+    返回:
+    dict: {
+        'best_ic_windows': [(window, ic_mean), ...],  # IC最大的窗口列表
+        'best_icir_windows': [(window, icir), ...],   # ICIR最大的窗口列表
+        'best_combined_windows': [window, ...],       # IC和ICIR综合最优的窗口（取并集）
+    }
+    """
+    ic_values = {}
+    icir_values = {}
+
+    for window, result in factor_results.items():
+        if result is None:
+            continue
+        ic_mean = result.get('ic_mean', np.nan)
+        icir = result.get('icir', np.nan)
+
+        # 使用绝对值比较（因为负IC也可能有效）
+        if not np.isnan(ic_mean):
+            ic_values[window] = abs(ic_mean)
+        if not np.isnan(icir):
+            icir_values[window] = abs(icir)
+
+    # 按绝对值排序，找到最大的窗口
+    sorted_ic = sorted(ic_values.items(), key=lambda x: x[1], reverse=True)
+    sorted_icir = sorted(icir_values.items(), key=lambda x: x[1], reverse=True)
+
+    # 取前top_n个
+    best_ic_windows = sorted_ic[:top_n]
+    best_icir_windows = sorted_icir[:top_n]
+
+    # 综合最优窗口（IC和ICIR的并集）
+    best_windows_set = set()
+    for window, _ in best_ic_windows:
+        best_windows_set.add(window)
+    for window, _ in best_icir_windows:
+        best_windows_set.add(window)
+
+    # 返回原始值（非绝对值）用于显示
+    best_ic_with_sign = []
+    for window, _ in best_ic_windows:
+        original_ic = factor_results[window]['ic_mean']
+        best_ic_with_sign.append((window, original_ic))
+
+    best_icir_with_sign = []
+    for window, _ in best_icir_windows:
+        original_icir = factor_results[window]['icir']
+        best_icir_with_sign.append((window, original_icir))
+
+    return {
+        'best_ic_windows': best_ic_with_sign,
+        'best_icir_windows': best_icir_with_sign,
+        'best_combined_windows': sorted(list(best_windows_set)),
+    }
+
+
+def create_best_windows_summary(all_results, top_n=2):
+    """
+    创建所有因子的最优窗口汇总表
+
+    参数:
+    all_results: dict, {factor_name: {window: analysis_result}}
+    top_n: int, 每个指标取前N个最优窗口
+
+    返回:
+    pd.DataFrame: 最优窗口汇总表
+    """
+    summary_data = []
+
+    for factor_name, factor_results in all_results.items():
+        if not factor_results:
+            continue
+
+        best_info = find_best_windows(factor_results, top_n)
+
+        # 格式化最优窗口信息
+        ic_windows_str = ', '.join([f"{w}日(IC={v:.4f})" for w, v in best_info['best_ic_windows']])
+        icir_windows_str = ', '.join([f"{w}日(ICIR={v:.4f})" for w, v in best_info['best_icir_windows']])
+        combined_windows_str = ', '.join([f"{w}日" for w in best_info['best_combined_windows']])
+
+        summary_data.append({
+            '因子名称': factor_name,
+            '最优IC窗口': ic_windows_str,
+            '最优ICIR窗口': icir_windows_str,
+            '综合最优窗口': combined_windows_str,
+        })
+
+    return pd.DataFrame(summary_data)
+
+
 def create_factor_summary_df(factor_name, factor_results, windows=WINDOWS):
     """
     创建单个因子的汇总DataFrame
@@ -1304,46 +1627,55 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
     """
     将所有因子分析结果导出到Excel
     每个因子一个sheet页
-    
+
     参数:
     all_results: dict, 所有因子的分析结果
     output_file: str, 输出文件名
     windows: list, 窗口列表
     """
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        # 首先创建汇总sheet页，展示所有因子的最优窗口
+        print("正在导出最优窗口汇总...")
+        best_windows_df = create_best_windows_summary(all_results, top_n=2)
+        if not best_windows_df.empty:
+            best_windows_df.to_excel(writer, sheet_name='最优窗口汇总', index=False)
+
         for factor_name, factor_results in all_results.items():
             print(f"正在导出因子: {factor_name}")
-            
+
             # 获取因子说明
             docstring = get_factor_docstring(factor_name)
-            
+
             # 获取数据日期范围
             start_date, end_date = get_data_date_range(factor_results, windows)
-            
+
+            # 获取该因子的最优窗口信息
+            best_info = find_best_windows(factor_results, top_n=2)
+
             # 创建汇总表
             summary_df = create_factor_summary_df(factor_name, factor_results, windows)
-            
+
             # 创建G5持仓记录（按列输出每个窗口）
             g5_holdings_df = create_g5_holdings_df(factor_results, windows)
-            
+
             # 创建IC累积序列
             ic_cumsum_df = create_ic_cumsum_df(factor_results, windows)
-            
+
             # 创建分层累积净值
             layer_nav_dict = create_layer_nav_df(factor_results, windows)
-            
+
             # 创建G5每年收益统计
             g5_yearly_dict = create_g5_yearly_returns_df(factor_results, windows)
-            
+
             # 写入sheet
             sheet_name = factor_name[:31]  # Excel sheet名最长31字符
-            
+
             # 写入因子说明标题
             start_row = 0
             title_df = pd.DataFrame({f'【因子说明】': [docstring]})
             title_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
             start_row += 3
-            
+
             # 写入数据日期范围
             if start_date and end_date:
                 date_range_df = pd.DataFrame({f'【数据日期范围】': [f'{start_date} 至 {end_date}']})
@@ -1351,7 +1683,19 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
                 start_row += 3
             else:
                 start_row += 1
-            
+
+            # 写入最优窗口信息
+            best_ic_str = ', '.join([f"{w}日(IC={v:.4f})" for w, v in best_info['best_ic_windows']])
+            best_icir_str = ', '.join([f"{w}日(ICIR={v:.4f})" for w, v in best_info['best_icir_windows']])
+            best_combined_str = ', '.join([f"{w}日" for w in best_info['best_combined_windows']])
+            best_windows_info = pd.DataFrame({
+                '【最优窗口】': [f'最优IC窗口: {best_ic_str}'],
+                '': [f'最优ICIR窗口: {best_icir_str}'],
+                ' ': [f'综合最优窗口: {best_combined_str}']
+            })
+            best_windows_info.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+            start_row += 3
+
             # 写入汇总表（行为指标，列为窗口，需要写入index）
             if not summary_df.empty:
                 # 写入汇总表标题
@@ -1360,18 +1704,19 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
                 start_row += 1
                 summary_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
                 start_row += len(summary_df) + 3
-            
-            # 写入G5每年收益统计（仅针对G5，各窗口）
-            for window in windows:
+
+            # 只对最优窗口输出详细的G5每年收益统计
+            best_combined_windows = best_info['best_combined_windows']
+            for window in best_combined_windows:
                 if window in g5_yearly_dict:
                     yearly_df = g5_yearly_dict[window]
-                    # 写入标题行
-                    header_df = pd.DataFrame({f'【G5每年收益统计 - {window}日窗口】': ['']})
+                    # 写入标题行（标记为最优窗口）
+                    header_df = pd.DataFrame({f'【G5每年收益统计 - {window}日窗口 ★最优】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
                     yearly_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += len(yearly_df) + 3
-            
+
             # 写入IC累积序列
             if not ic_cumsum_df.empty:
                 # 写入标题行
@@ -1380,33 +1725,112 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
                 start_row += 1
                 ic_cumsum_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
                 start_row += len(ic_cumsum_df) + 3
-            
-            # 写入分层累积净值（每个窗口单独输出）
-            for window in windows:
+
+            # 只对最优窗口输出分层累积净值
+            for window in best_combined_windows:
                 if window in layer_nav_dict:
                     nav_df = layer_nav_dict[window]
-                    # 写入标题行
-                    header_df = pd.DataFrame({f'【分层累积净值 - {window}日窗口】': ['']})
+                    # 写入标题行（标记为最优窗口）
+                    header_df = pd.DataFrame({f'【分层累积净值 - {window}日窗口 ★最优】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
                     nav_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
                     start_row += len(nav_df) + 3
-            
-            # 写入G5持仓记录（按列输出每个窗口，日期降序）
+
+            # 只对最优窗口输出G5持仓记录
             if not g5_holdings_df.empty:
-                # 写入标题行
-                header_df = pd.DataFrame({f'【G5持仓行业 - 各窗口】': ['']})
-                header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
-                start_row += 1
-                g5_holdings_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
-                start_row += len(g5_holdings_df) + 3
-    
+                # 筛选最优窗口的列
+                best_cols = [col for col in g5_holdings_df.columns if any(f'{w}日' in str(col) for w in best_combined_windows)]
+                if best_cols:
+                    g5_holdings_best_df = g5_holdings_df[best_cols]
+                    # 写入标题行
+                    header_df = pd.DataFrame({f'【G5持仓行业 - 最优窗口】': ['']})
+                    header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+                    start_row += 1
+                    g5_holdings_best_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
+                    start_row += len(g5_holdings_best_df) + 3
+
     print(f"\n分析报告已导出到: {output_file}")
 
 
 def list_factors():
     """列出所有可用因子"""
     return list(FACTOR_REGISTRY.keys())
+
+
+def format_excel_report(file_path: str):
+    """
+    调整Excel报告文件格式
+    
+    功能：
+    1. 将每个sheet页的A列设置为左对齐
+    2. 将每个sheet页的A列宽度设置为11
+    3. 隐藏每个sheet页的19行到52行
+    4. 比较B9-E9的值，将最大值所在列的8-51行加粗
+    
+    参数:
+        file_path: str, Excel文件路径
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Font
+    
+    # 加载工作簿
+    wb = load_workbook(file_path)
+    
+    # 遍历所有sheet页
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        print(f"正在格式化sheet: {sheet_name}")
+        
+        # 1. 设置A列宽度为11
+        ws.column_dimensions['A'].width = 11
+        
+        # 2. 设置A列左对齐
+        for row in range(1, ws.max_row + 1):
+            cell = ws.cell(row=row, column=1)  # A列是第1列
+            cell.alignment = Alignment(horizontal='left')
+        
+        # 3. 隐藏19行到52行
+        for row in range(19, 53):  # 19到52行（包含52）
+            ws.row_dimensions[row].hidden = True
+        
+        # 4. 比较B9-E9的值，将最大值所在列的8-51行加粗
+        # B=2, C=3, D=4, E=5
+        values = {}
+        for col in range(2, 6):  # B到E列
+            cell_value = ws.cell(row=9, column=col).value
+            if cell_value is not None:
+                try:
+                    values[col] = float(cell_value)
+                except (ValueError, TypeError):
+                    values[col] = float('-inf')
+            else:
+                values[col] = float('-inf')
+        
+        if values:
+            max_col = max(values, key=values.get)
+            print(f"  B9-E9最大值在第{max_col}列 (值={values[max_col]})")
+            
+            # 将该列的8-51行加粗
+            for row in range(8, 52):  # 8到51行
+                cell = ws.cell(row=row, column=max_col)
+                # 保留原有字体属性，只修改bold
+                if cell.font:
+                    new_font = copy(cell.font)
+                    new_font = Font(
+                        name=cell.font.name,
+                        size=cell.font.size,
+                        bold=True,
+                        italic=cell.font.italic,
+                        color=cell.font.color
+                    )
+                else:
+                    new_font = Font(bold=True)
+                cell.font = new_font
+    
+    # 保存文件
+    wb.save(file_path)
+    print(f"Excel格式调整完成: {file_path}")
 
 
 if __name__ == "__main__":
@@ -1449,5 +1873,9 @@ if __name__ == "__main__":
     # 导出到Excel
     print("\n正在导出到Excel...")
     export_to_excel(all_results, OUTPUT_FILE, WINDOWS_TO_TEST)
+    
+    # 格式化Excel报告
+    print("\n正在格式化Excel报告...")
+    format_excel_report(OUTPUT_FILE)
     
     print("\n分析完成！")

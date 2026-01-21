@@ -40,6 +40,10 @@ env/
 # *.pkl
 # *.csv
 
+# Large data files (exceeding GitHub's 100MB limit)
+data/个股_复权收盘价.csv
+data/个股_流通市值.csv
+
 # OS files
 .DS_Store
 Thumbs.db

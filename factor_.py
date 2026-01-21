@@ -175,7 +175,9 @@ def momentum_rank_zscore(prices_df, window):
     
     return momentum_rank_std_factor
 
-
+"""
+平稳动量因子
+"""
 def momentum_turnover_adj(prices_df, turnover_df, window):
     """
     换手率调整动量因子（量价背离动量）
@@ -713,12 +715,17 @@ def momentum_amplitude_cut(high_df, low_df, prices_df, window=60,
     return factor_df
 
 
+"""
+特质收益动量因子
+"""
 def momentum_pure_liquidity_stripped(prices_df, turnover_df, window=20,
                                       zscore_window=240, smooth_window=3,
                                       min_industries=15):
     """
     剥离流动性提纯动量因子（Liquidity-Stripped Pure Momentum）
     
+    出处：2019年6月15日 光大证券 《再论动量因子——多因子系列报告之二十二》 周萧潇、刘均伟
+
     理念：区分"非理性繁荣"（换手率异常、情绪过热）和"基本面推动的稳健上涨"，
           通过截面回归剔除流动性和情绪成分，提取"特质动量"（残差）。
     构造：
@@ -834,7 +841,113 @@ def momentum_pure_liquidity_stripped(prices_df, turnover_df, window=20,
     return pure_momentum_factor
 
 
-def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_periods=36, benchmark_returns=None):
+def momentum_residual(industry_returns_df, barra_factor_returns_df, window):
+    """
+    行业残差动量因子 (Industry Residual Momentum)
+    
+    出处：兴业证券《基于盈余惊喜(基本面)、残差动量(技术面)、北向资金(资金流)的行业轮动模型》2022年3月27日
+    
+    理念：
+    - 传统动量存在"动量崩溃"风险，在市场由熊转牛时容易踏空
+    - 涨跌幅 = 大盘环境(Beta) + 风格运气(Style) + 自身实力(Alpha/Residual)
+    - 残差动量剥离市场和风格因素，只保留行业"特质性"收益
+    - 寻找"无论大盘和风格如何变动，凭借自身逻辑依然表现强势"的行业
+    
+    构造：
+    1. 对每个行业，在过去 window 天内进行时间序列OLS回归：
+       R_{i,t} = α_i + Σ(β_{i,k} * F_{k,t}) + ε_{i,t}
+    2. 残差ε代表剥离Barra因子后的特质收益
+    3. 由于OLS回归的残差咍恒为0，改用残差的累计收益率作为特质动量
+       因子值 = (1+ε_1)*(1+ε_2)*...*(1+ε_N) - 1 / σ_ε
+       简化计算：因子值 = Σε / σ_ε （妙发ε较小时近似等价）
+       实际计算：用回归的截距项α作为特质收益率，结合残差标准差构建IR
+    
+    参数:
+        industry_returns_df: pd.DataFrame, 行业日频收益率 (index=日期, columns=行业)
+        barra_factor_returns_df: pd.DataFrame, Barra风格因子日频收益率
+            - index: 日期
+            - columns: 因子名称 (市场, Size, Beta, Momentum, ResidualVolatility, 
+                       NonlinearSize, BookToPrice, Liquidity, EarningsYield, Growth, Leverage)
+        window: int, 回溯窗口（交易日）
+    
+    返回:
+        pd.DataFrame, 残差动量因子值，值越大表示特质动量越强
+    """
+    import statsmodels.api as sm
+    
+    # 确保日期索引对齐
+    common_dates = industry_returns_df.index.intersection(barra_factor_returns_df.index)
+    industry_returns = industry_returns_df.loc[common_dates].copy()
+    barra_returns = barra_factor_returns_df.loc[common_dates].copy()
+    
+    # 初始化结果DataFrame
+    factor_df = pd.DataFrame(index=industry_returns.index, 
+                             columns=industry_returns.columns, 
+                             dtype=float)
+    
+    industries = industry_returns.columns.tolist()
+    n_dates = len(common_dates)
+    
+    # 对每个行业进行滚动回归
+    for col in industries:
+        industry_ret = industry_returns[col]
+        
+        # 从 window 开始计算，确保有足够的历史数据
+        for i in range(window, n_dates):
+            # 截取窗口期内的数据
+            start_idx = i - window
+            end_idx = i  # 不包含当天，避免前视偏差
+            
+            y = industry_ret.iloc[start_idx:end_idx]
+            X = barra_returns.iloc[start_idx:end_idx]
+            
+            # 数据对齐和清洗
+            valid_mask = y.notna() & X.notna().all(axis=1)
+            y_valid = y[valid_mask]
+            X_valid = X[valid_mask]
+            
+            # 至少需要一定数量的有效数据点
+            min_obs = max(30, len(X.columns) + 5)  # 至少比因子数多5个观测值
+            if len(y_valid) < min_obs:
+                continue
+            
+            try:
+                # OLS回归，添加常数项
+                X_with_const = sm.add_constant(X_valid)
+                model = sm.OLS(y_valid, X_with_const).fit()
+                
+                # 获取回归结果
+                # 截距项α代表剥离因子后的平均特质收益率（日均）
+                alpha = model.params['const']
+                # 残差标准差代表特质收益的波动率
+                residual_std = model.resid.std()
+                
+                # 计算残差动量IR = α * sqrt(N) / σ_ε
+                # 年化的特质收益率 / 特质波动率
+                # 或者简化为：α * N / σ_ε （累计特质收益 / 特质波动率）
+                n_obs = len(y_valid)
+                if residual_std > 0:
+                    # 累计特质收益 = α * N
+                    cumulative_alpha = alpha * n_obs
+                    factor_value = cumulative_alpha / residual_std
+                else:
+                    factor_value = 0.0
+                
+                # 记录当天的因子值
+                current_date = common_dates[i]
+                factor_df.loc[current_date, col] = factor_value
+                
+            except Exception:
+                # 回归失败时跳过
+                continue
+    
+    return factor_df
+
+
+"""
+行业间相关性动量因子
+"""
+def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_returns, train_periods=36):
     """
     行业间相关性动量因子（基于Lasso回归的领先滞后关系）
     
@@ -848,8 +961,8 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_perio
         prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
         window: int, 回溯窗口（交易日），常用20/60
         rebalance_freq: int, 调仓频率（交易日），常用20
+        benchmark_returns: pd.Series, 基准收益率序列
         train_periods: int, 训练样本数量（调仓周期数），默认36
-        benchmark_returns: pd.Series or None, 基准收益率序列，默认等权平均
     
     返回:
         pd.DataFrame, 预测的未来超额收益，值越大预测表现越好
@@ -861,16 +974,12 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_perio
         lookback_returns = prices_df.pct_change(window)
         forward_returns = prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
         
-        if benchmark_returns is None:
-            lookback_benchmark = lookback_returns.mean(axis=1)
-            forward_benchmark = forward_returns.mean(axis=1)
-        else:
-            lookback_benchmark = benchmark_returns.rolling(window).apply(
-                lambda x: (1 + x).prod() - 1, raw=True
-            )
-            forward_benchmark = benchmark_returns.rolling(rebalance_freq).apply(
-                lambda x: (1 + x).prod() - 1, raw=True
-            ).shift(-rebalance_freq)
+        lookback_benchmark = benchmark_returns.rolling(window).apply(
+            lambda x: (1 + x).prod() - 1, raw=True
+        )
+        forward_benchmark = benchmark_returns.rolling(rebalance_freq).apply(
+            lambda x: (1 + x).prod() - 1, raw=True
+        ).shift(-rebalance_freq)
         
         excess_lookback = lookback_returns.sub(lookback_benchmark, axis=0)
         excess_forward = forward_returns.sub(forward_benchmark, axis=0)
@@ -941,495 +1050,649 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, train_perio
         return predictions
 
 
-# ============================================================================
-# 兴业证券"正向泡沫"行业轮动因子
-# 出处：《如何结合行业轮动的长短信号？》
-# 尚未解决 逻辑 + 代码
-# ============================================================================
-class GaussianBOCD:
+"""
+行业内关系动量因子
+"""
+def momentum_industry_component(prices_df, window, constituent_df, stock_price_df, industry_code_df, min_stocks=8, std_floor=0.01):
     """
-    高斯贝叶斯在线变点检测 (Gaussian Bayesian Online Changepoint Detection)
+    行业成分股动量因子 (Industry Component Momentum)
     
-    基于 Adams & MacKay (2007) 的算法实现，假设数据服从正态分布。
-    使用 Normal-Inverse-Gamma 共轭先验，预测分布为 Student-t 分布。
+    出处：20221201-东方证券-《量化策略研究之六》：行业动量的刻画
     
-    参数:
-        hazard: float, 变点发生的先验概率 (1/expected_run_length)，默认0.01
-        mu0: float, 均值的先验均值，默认0
-        kappa0: float, 均值先验的强度参数，默认1
-        alpha0: float, 方差先验的形状参数，默认1
-        beta0: float, 方差先验的尺度参数，默认1
-    """
-    
-    def __init__(self, hazard=0.01, mu0=0.0, kappa0=1.0, alpha0=1.0, beta0=1.0):
-        self.hazard = hazard
-        self.mu0 = mu0
-        self.kappa0 = kappa0
-        self.alpha0 = alpha0
-        self.beta0 = beta0
-        
-        # 初始化运行长度概率分布
-        # run_length_probs[r] = P(run_length = r)
-        self.run_length_probs = np.array([1.0])  # 初始时 P(r=0) = 1
-        
-        # 每个 run length 对应的充分统计量
-        # 使用列表存储，索引对应 run length
-        self.mu_params = [mu0]      # 后验均值
-        self.kappa_params = [kappa0]  # 后验 kappa
-        self.alpha_params = [alpha0]  # 后验 alpha
-        self.beta_params = [beta0]    # 后验 beta
-        
-    def _student_t_pdf(self, x, mu, kappa, alpha, beta):
-        """
-        计算 Student-t 预测分布的概率密度
-        
-        预测分布: x | data ~ Student-t(2*alpha, mu, beta*(kappa+1)/(alpha*kappa))
-        """
-        df = 2 * alpha  # 自由度
-        scale = np.sqrt(beta * (kappa + 1) / (alpha * kappa))
-        
-        # 使用 scipy 的 t 分布
-        return stats.t.pdf(x, df=df, loc=mu, scale=scale)
-    
-    def update(self, x):
-        """
-        接收新数据点并更新 run length 概率分布
-        
-        参数:
-            x: float, 新的观测值（收益率）
-        
-        返回:
-            np.array, 更新后的 run length 概率分布
-        """
-        n = len(self.run_length_probs)
-        
-        # Step 1: 计算每个 run length 下观测 x 的预测概率
-        pred_probs = np.zeros(n)
-        for r in range(n):
-            pred_probs[r] = self._student_t_pdf(
-                x,
-                self.mu_params[r],
-                self.kappa_params[r],
-                self.alpha_params[r],
-                self.beta_params[r]
-            )
-        
-        # Step 2: 计算增长概率 (growth probabilities)
-        # P(r_t = r+1, x_{1:t}) = P(r_{t-1} = r, x_{1:t-1}) * (1 - H) * P(x_t | r)
-        growth_probs = self.run_length_probs * (1 - self.hazard) * pred_probs
-        
-        # Step 3: 计算变点概率 (changepoint probability)
-        # P(r_t = 0, x_{1:t}) = sum_r P(r_{t-1} = r, x_{1:t-1}) * H * P(x_t | r)
-        cp_prob = np.sum(self.run_length_probs * self.hazard * pred_probs)
-        
-        # Step 4: 组合新的 run length 分布
-        new_run_length_probs = np.zeros(n + 1)
-        new_run_length_probs[0] = cp_prob
-        new_run_length_probs[1:] = growth_probs
-        
-        # Step 5: 归一化
-        total = np.sum(new_run_length_probs)
-        if total > 0:
-            new_run_length_probs /= total
-        
-        # Step 6: 更新充分统计量
-        # 对于 r = 0 (新的 run)，使用先验参数
-        new_mu = [self.mu0]
-        new_kappa = [self.kappa0]
-        new_alpha = [self.alpha0]
-        new_beta = [self.beta0]
-        
-        # 对于 r > 0，更新后验参数
-        for r in range(n):
-            mu_old = self.mu_params[r]
-            kappa_old = self.kappa_params[r]
-            alpha_old = self.alpha_params[r]
-            beta_old = self.beta_params[r]
-            
-            # Normal-Inverse-Gamma 后验更新公式
-            kappa_new = kappa_old + 1
-            mu_new = (kappa_old * mu_old + x) / kappa_new
-            alpha_new = alpha_old + 0.5
-            beta_new = beta_old + 0.5 * kappa_old * (x - mu_old)**2 / kappa_new
-            
-            new_mu.append(mu_new)
-            new_kappa.append(kappa_new)
-            new_alpha.append(alpha_new)
-            new_beta.append(beta_new)
-        
-        # 更新状态
-        self.run_length_probs = new_run_length_probs
-        self.mu_params = new_mu
-        self.kappa_params = new_kappa
-        self.alpha_params = new_alpha
-        self.beta_params = new_beta
-        
-        return self.run_length_probs
-    
-    def get_change_prob(self, max_run_length=5):
-        """
-        获取"最近发生变点"的概率
-        
-        参数:
-            max_run_length: int, 认为是"新趋势"的最大 run length
-        
-        返回:
-            float, P(run_length <= max_run_length)
-        """
-        if len(self.run_length_probs) <= max_run_length:
-            return np.sum(self.run_length_probs)
-        return np.sum(self.run_length_probs[:max_run_length + 1])
-    
-    def reset(self):
-        """重置检测器状态"""
-        self.run_length_probs = np.array([1.0])
-        self.mu_params = [self.mu0]
-        self.kappa_params = [self.kappa0]
-        self.alpha_params = [self.alpha0]
-        self.beta_params = [self.beta0]
-
-
-def momentum_positive_bubble(prices_df, amount_df,
-                              bsadf_min_window=62,
-                              bsadf_compare_window=40,
-                              bocd_hazard=0.01,
-                              bocd_run_length_threshold=5,
-                              regime_lookback=4,
-                              similarity_lookback=52,
-                              similarity_top_n=8,
-                              similarity_threshold=4):
-    """
-    正向泡沫行业轮动因子（兴业证券"理性泡沫"策略）
-    
-    出处：兴业证券《如何结合行业轮动的长短信号？》
-    
-    理念：利用"理性泡沫"理论，通过 BSADF（量价爆炸检测）和 BOCD（结构突变检测）
-          捕捉行业的起涨点，并结合市场环境进行风控。
+    理念：
+    - 核心思想："一荣俱荣"才是真景气
+    - 行业指数的上涨可能仅由一两只高权重龙头股拉动（虚胖），也可能是行业内所有公司业绩改善带来的普涨（实壮）
+    - 后者代表了行业整体的基本面逻辑极其顺畅，多头共识极强，因此未来的趋势持续性更好
+    - 类似于在横截面上计算"夏普比率"：不仅看涨幅（均值），还要看涨得乱不乱（标准差）
+    - 当行业内个股收益率离散度（Dispersion）低时，意味着市场对该行业的利好解读是一致的，反转风险小
     
     构造：
-        1. 数据预处理：日频转周频（W-FRI）
-        2. BSADF信号：价格和成交额的泡沫检测，双重确认
-        3. BOCD信号：收益率变点检测，捕捉趋势起点
-        4. 市场环境：根据牛熊市状态调整信号
-        5. 信号合成：牛市扩散、熊市清仓、震荡维持
+    - 核心公式：S_i = μ_i / σ_i
+    - μ_i：行业内所有成分股在考察期内累计收益率的算术平均值（等权）
+    - σ_i：行业内所有成分股累计收益率的标准差
+    - 分子大 → 行业整体涨得好
+    - 分母小 → 行业内部分歧小（大家涨幅差不多）
+    - 结果 → 涨得又好又稳的行业得分最高
+    
+    注意事项：
+    - 使用Point-in-Time数据：必须用"当时那个月该行业包含哪些股票"来计算
+    - 等权计算：赋予行业内中小盘股和龙头股相同的权重，反映行业景气度的扩散程度
+    - 分母陷阱：对成分股极少的行业，标准差可能异常小，需设置门槛和下限
     
     参数:
-        prices_df: pd.DataFrame, 日频收盘价数据 (index=日期, columns=行业)
-        amount_df: pd.DataFrame, 日频成交额数据 (index=日期, columns=行业)
-        bsadf_min_window: int, BSADF最小窗口（周），默认62
-        bsadf_compare_window: int, BSADF动态阈值比较窗口（周），默认40
-        bocd_hazard: float, BOCD变点先验概率，默认0.01 (1/100)
-        bocd_run_length_threshold: int, BOCD新趋势判定阈值，默认5
-        regime_lookback: int, 市场状态回看周数，默认4
-        similarity_lookback: int, 相似度计算回看周数，默认52
-        similarity_top_n: int, 相似行业数量（含自己），默认8
-        similarity_threshold: int, 牛市扩散阈值，默认4
+        prices_df: pd.DataFrame, 行业指数价格数据 (index=日期, columns=行业)
+        window: int, 回溯窗口（交易日）
+        constituent_df: pd.DataFrame, 行业成分股数据（通过data_loader.load_constituent_df()加载）
+        stock_price_df: pd.DataFrame, 个股复权收盘价数据（通过data_loader.load_stock_price_df()加载）
+        industry_code_df: pd.DataFrame, 行业代码映射数据（通过data_loader.load_industry_code_df()加载）
+        min_stocks: int, 最少成分股数量门槛，默认8
+        std_floor: float, 标准差下限，防止分母过小，默认0.01
     
     返回:
-        pd.DataFrame, 周频因子值 (0/1信号)，index为周五日期，columns为行业名称
+        pd.DataFrame, 行业成分股动量因子值，值越大表示行业"一致性上涨"越强
     """
-    from statsmodels.tsa.stattools import adfuller
-    from sklearn.metrics.pairwise import cosine_similarity
+    from data_loader import get_industry_name_to_code_map
     
-    # ========== Phase 1: 数据预处理 - 日频转周频 ==========
+    # ========== 第一阶段：构建行业名称到行业代码的映射 ==========
     
-    def resample_to_weekly(prices, amount):
+    industries = prices_df.columns.tolist()
+    
+    # 获取行业名称到代码的映射
+    sw_industry_codes = get_industry_name_to_code_map(industry_code_df)
+    
+    # 构建行业名称到代码的映射
+    industry_name_to_code = {}
+    for ind_name in industries:
+        clean_name = ind_name.replace('（申万）', '').replace('(申万)', '')
+        if clean_name in sw_industry_codes:
+            industry_name_to_code[ind_name] = sw_industry_codes[clean_name]
+    
+    # ========== 第三阶段：定义辅助函数 ==========
+    
+    def get_constituent_stocks_pit(industry_code, date, constituent_data):
         """
-        将日频数据重采样为周频
-        - 收盘价：取当周最后一个交易日的值
-        - 成交额：取当周所有交易日的总和
+        获取指定行业在指定日期的成分股列表（Point-in-Time）
+        使用该日期之前最近的成分股数据
         """
-        # 确保索引是 DatetimeIndex
-        prices = prices.copy()
-        amount = amount.copy()
-        prices.index = pd.to_datetime(prices.index)
-        amount.index = pd.to_datetime(amount.index)
+        # 找到该日期之前最近的成分股数据
+        valid_dates = constituent_data[constituent_data['date'] <= date]['date'].unique()
+        if len(valid_dates) == 0:
+            return []
         
-        # 重采样到周五
-        weekly_close = prices.resample('W-FRI').last()
-        weekly_amount = amount.resample('W-FRI').sum()
+        latest_date = max(valid_dates)
         
-        # 剔除空周（长假导致的无数据周）
-        valid_weeks = weekly_close.notna().any(axis=1) & weekly_amount.notna().any(axis=1)
-        weekly_close = weekly_close[valid_weeks]
-        weekly_amount = weekly_amount[valid_weeks]
+        # 筛选该行业的成分股
+        mask = (constituent_data['date'] == latest_date) & (constituent_data['index_code'] == industry_code)
+        industry_constituents = constituent_data[mask]
         
-        # 计算周收益率
-        weekly_returns = weekly_close.pct_change()
+        if len(industry_constituents) == 0:
+            return []
         
-        return weekly_close, weekly_amount, weekly_returns
+        return industry_constituents['wind_code'].tolist()
     
-    # ========== Phase 2: BSADF 泡沫检测 ==========
-    
-    def calc_bsadf_stat(series, min_window):
+    def calculate_stock_returns(stock_codes, date, price_df, lookback_window):
         """
-        计算 Backward Sup ADF (BSADF) 统计量序列
+        计算指定股票在指定日期往前lookback_window天的累计收益率
+        剔除数据不完整的股票（新股、长期停牌）
+        """
+        if date not in price_df.index:
+            return pd.Series(dtype=float)
         
-        对于每个时间点 t，从最小窗口开始递归扩大窗口，
-        取所有窗口 ADF 统计量的最大值。
+        date_idx = price_df.index.get_loc(date)
+        if date_idx < lookback_window:
+            return pd.Series(dtype=float)
         
-        参数:
-            series: pd.Series, 对数价格或对数成交额序列
-            min_window: int, 最小窗口长度
+        # 获取窗口期的起始和结束价格
+        start_idx = date_idx - lookback_window
+        start_date = price_df.index[start_idx]
+        
+        # 筛选有效的股票代码
+        valid_codes = [code for code in stock_codes if code in price_df.columns]
+        if len(valid_codes) == 0:
+            return pd.Series(dtype=float)
+      
+        # 获取起始和结束价格
+        start_prices = price_df.loc[start_date, valid_codes]
+        end_prices = price_df.loc[date, valid_codes]
+        
+        # 计算累计收益率
+        returns = (end_prices / start_prices) - 1
+        
+        # 剔除无效数据（NaN、Inf）
+        returns = returns.replace([np.inf, -np.inf], np.nan)
+        returns = returns.dropna()
+        
+        return returns
+    
+    # ========== 第四阶段：计算因子值 ==========
+    
+    # 初始化结果DataFrame
+    factor_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    
+    all_dates = prices_df.index.tolist()
+    total_dates = len(all_dates)
+    
+    print("正在计算行业成分股动量因子...")
+    
+    for i, date in enumerate(all_dates):
+        if i < window:
+            continue
+        
+        if i % 100 == 0:
+            print(f"  进度: {i}/{total_dates}")
+        
+        for ind_name in industries:
+            if ind_name not in industry_name_to_code:
+                continue
+            
+            ind_code = industry_name_to_code[ind_name]
+            
+            # 获取当时的成分股（Point-in-Time）
+            stocks = get_constituent_stocks_pit(ind_code, date, constituent_df)
+            
+            # 检查成分股数量门槛
+            if len(stocks) < min_stocks:
+                continue
+            
+            # 计算成分股的累计收益率
+            stock_returns = calculate_stock_returns(stocks, date, stock_price_df, window)
+            
+            # 再次检查有效股票数量
+            if len(stock_returns) < min_stocks:
+                continue
+            
+            # 计算均值和标准差
+            mu = stock_returns.mean()
+            sigma = stock_returns.std()
+            
+            # 应用标准差下限
+            sigma = max(sigma, std_floor)
+            
+            # 计算因子值：μ / σ
+            factor_value = mu / sigma
+            
+            factor_df.loc[date, ind_name] = factor_value
+    
+    # 处理无穷大和NaN
+    factor_df = factor_df.replace([np.inf, -np.inf], np.nan)
+    
+    print("行业成分股动量因子计算完成")
+    
+    return factor_df
+
+
+def momentum_pca(prices_df, window, pca_window, lag, constituent_df, stock_price_df, stock_mv_df, industry_code_df, weight_threshold=0.80, min_stocks=8, max_stocks=50, suspension_threshold=0.20, n_components=2):
+    """
+    PcaMom（技术面内生动量）行业轮动因子
+    
+    出处：兴业证券 - 《分歧和共振——直击行业轮动痛点》2024.04
+    分析师：刘海燕、郑兆磊
+    
+    理念：
+    - 解决传统动量策略在"快速轮动"和"抱团瓦解"行情中失效的痛点
+    - 不仅看涨幅（量），更看涨得健不健康（质）
+    - 共振（Resonance）：行业指数涨 + 成分股合力上涨（集中度高）→ 真主线，敢上仓位
+    - 分歧（Divergence）：行业指数涨 + 仅靠权重股拉升/内部混乱（集中度低）→ 鱼尾行情，谨慎参与
+    
+    构造：
+    - 总公式：PcaMom_t = Mom_{t,N} × (PcaScore_t / PcaScore_{t-Lag})
+    - Mom_{t,N}：行业指数在过去N天的涨跌幅
+    - PcaScore_t：行业内代表性股票过去W天日收益率矩阵的PCA分解，取前2个主成分的解释率之和
+    - Ratio：PcaScore_t / PcaScore_{t-Lag}，衡量持有期内结构是凝聚了还是散了
+    
+    信号解读：
+    - 正动量 + Ratio>1（凝聚）：主升浪，Strong Buy
+    - 正动量 + Ratio<1（分歧）：强弩之末，Neutral/Sell
+    - 负动量 + Ratio>1（凝聚）：主跌浪，Strong Sell
+    - 负动量 + Ratio<1（分歧）：左侧震荡，Wait
+    
+    参数:
+        prices_df: pd.DataFrame, 行业指数价格数据 (index=日期, columns=行业)
+        window: int, 动量计算窗口（交易日）
+        pca_window: int, PCA计算窗口（交易日）
+        lag: int, PcaScore变化率的滞后期（交易日）
+        constituent_df: pd.DataFrame, 行业成分股数据（通过data_loader.load_constituent_df()加载）
+        stock_price_df: pd.DataFrame, 个股复权收盘价数据（通过data_loader.load_stock_price_df()加载）
+        stock_mv_df: pd.DataFrame, 个股流通市值数据（通过data_loader.load_stock_mv_df()加载）
+        industry_code_df: pd.DataFrame, 行业代码映射数据（通过data_loader.load_industry_code_df()加载）
+        weight_threshold: float, 累计权重阈值，默认0.80
+        min_stocks: int, 最少选取股票数，默认8
+        max_stocks: int, 最多选取股票数，默认50
+        suspension_threshold: float, 停牌剔除阈值，默认0.20
+        n_components: int, PCA主成分数量，默认2
+    
+    返回:
+        pd.DataFrame, PcaMom因子值，值越大表示动量越强且结构越凝聚
+    """
+    from sklearn.decomposition import PCA
+    from data_loader import get_industry_name_to_code_map
+    
+    # ========== 第一阶段：数据准备 ==========
+    # 计算个股日收益率
+    stock_returns_df = stock_price_df.pct_change()
+    
+    # ========== 第二阶段：构建行业-成分股映射 ==========
+    
+    # 获取所有行业（从prices_df的列名中提取）
+    industries = prices_df.columns.tolist()
+    
+    # 获取行业名称到代码的映射
+    sw_industry_codes = get_industry_name_to_code_map(industry_code_df)
+    
+    # ========== 第三阶段：计算动量因子 ==========
+    
+    # 计算行业指数动量
+    momentum_df = prices_df.pct_change(window)
+    
+    # ========== 第四阶段：计算PcaScore ==========
+    
+    def get_constituent_stocks(industry_code, date, constituent_data, weight_thresh, min_n, max_n):
+        """
+        获取指定行业在指定日期的成分股列表
+        按权重排序，选取累计权重达到阈值的头部股票
+        """
+        # 找到该日期之前最近的成分股数据
+        valid_dates = constituent_data[constituent_data['date'] <= date]['date'].unique()
+        if len(valid_dates) == 0:
+            return []
+        
+        latest_date = max(valid_dates)
+        
+        # 筛选该行业的成分股
+        mask = (constituent_data['date'] == latest_date) & (constituent_data['index_code'] == industry_code)
+        industry_constituents = constituent_data[mask].copy()
+        
+        if len(industry_constituents) == 0:
+            return []
+        
+        # 按权重排序（降序）
+        industry_constituents = industry_constituents.sort_values('i_weight', ascending=False)
+        
+        # 计算累计权重
+        industry_constituents['cum_weight'] = industry_constituents['i_weight'].cumsum() / industry_constituents['i_weight'].sum()
+        
+        # 选取累计权重达到阈值的股票
+        selected = industry_constituents[industry_constituents['cum_weight'] <= weight_thresh]
+        
+        # 如果选取的股票数量不足，补充到最小数量
+        if len(selected) < min_n:
+            selected = industry_constituents.head(min(min_n, len(industry_constituents)))
+        
+        # 如果选取的股票数量超过最大值，截断
+        if len(selected) > max_n:
+            selected = selected.head(max_n)
+        
+        return selected['wind_code'].tolist()
+    
+    def calculate_pca_score(stock_codes, date, returns_df, pca_win, susp_thresh, n_comp):
+        """
+        计算指定股票组合在指定日期的PcaScore
+        """
+        if len(stock_codes) < n_comp + 1:
+            return np.nan
+        
+        # 获取日期索引
+        if date not in returns_df.index:
+            return np.nan
+        
+        date_idx = returns_df.index.get_loc(date)
+        if date_idx < pca_win:
+            return np.nan
+        
+        # 获取窗口期内的收益率数据
+        start_idx = date_idx - pca_win
+        window_returns = returns_df.iloc[start_idx:date_idx]
+        
+        # 筛选有效的股票代码
+        valid_codes = [code for code in stock_codes if code in window_returns.columns]
+        if len(valid_codes) < n_comp + 1:
+            return np.nan
+        
+        # 获取这些股票的收益率矩阵
+        returns_matrix = window_returns[valid_codes].copy()
+        
+        # 停牌处理：剔除停牌时间超过阈值的股票
+        # 停牌判断：收益率为0或NaN
+        suspension_ratio = (returns_matrix.isna() | (returns_matrix == 0)).sum() / len(returns_matrix)
+        valid_stocks = suspension_ratio[suspension_ratio < susp_thresh].index.tolist()
+        
+        if len(valid_stocks) < n_comp + 1:
+            return np.nan
+        
+        returns_matrix = returns_matrix[valid_stocks]
+        
+        # 填充NaN值（用0填充，表示停牌日无收益）
+        returns_matrix = returns_matrix.fillna(0)
+        
+        # Z-Score标准化（对每列进行标准化）
+        returns_std = returns_matrix.std()
+        returns_mean = returns_matrix.mean()
+        # 避免除以0
+        returns_std = returns_std.replace(0, 1)
+        returns_matrix_normalized = (returns_matrix - returns_mean) / returns_std
+        
+        # 再次填充可能产生的NaN
+        returns_matrix_normalized = returns_matrix_normalized.fillna(0)
+        
+        # PCA分解
+        try:
+            pca = PCA(n_components=min(n_comp, len(valid_stocks)))
+            pca.fit(returns_matrix_normalized.values)
+            
+            # 取前n_comp个主成分的解释率之和
+            pca_score = sum(pca.explained_variance_ratio_[:n_comp])
+            return pca_score
+        except Exception:
+            return np.nan
+    
+    # 初始化PcaScore DataFrame
+    pca_score_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    
+    # 构建行业名称到行业代码的映射
+    industry_name_to_code = {}
+    for ind_name in industries:
+        clean_name = ind_name.replace('（申万）', '').replace('(申万)', '')
+        if clean_name in sw_industry_codes:
+            industry_name_to_code[ind_name] = sw_industry_codes[clean_name]
+    
+    # 计算每个行业每天的PcaScore
+    all_dates = prices_df.index.tolist()
+    
+    # 为了效率，只在调仓日计算（这里简化为每天计算）
+    # 实际应用中可以只在调仓日计算
+    
+    print("正在计算PcaScore...")
+    total_dates = len(all_dates)
+    
+    for i, date in enumerate(all_dates):
+        if i < pca_window + lag:
+            continue
+        
+        if i % 100 == 0:
+            print(f"  进度: {i}/{total_dates}")
+        
+        for ind_name in industries:
+            if ind_name not in industry_name_to_code:
+                continue
+            
+            ind_code = industry_name_to_code[ind_name]
+            
+            # 获取成分股
+            stocks = get_constituent_stocks(
+                ind_code, date, constituent_df,
+                weight_threshold, min_stocks, max_stocks
+            )
+            
+            if len(stocks) == 0:
+                continue
+            
+            # 计算PcaScore
+            pca_score = calculate_pca_score(
+                stocks, date, stock_returns_df,
+                pca_window, suspension_threshold, n_components
+            )
+            
+            pca_score_df.loc[date, ind_name] = pca_score
+    
+    # ========== 第五阶段：计算PcaMom因子 ==========
+    
+    # 计算PcaScore的变化率（Ratio）
+    pca_score_lag = pca_score_df.shift(lag)
+    pca_ratio = pca_score_df / pca_score_lag
+    
+    # 处理无穷大和NaN
+    pca_ratio = pca_ratio.replace([np.inf, -np.inf], np.nan)
+    
+    # 计算最终因子值
+    pca_mom_factor = momentum_df * pca_ratio
+    
+    # 处理无穷大和NaN
+    pca_mom_factor = pca_mom_factor.replace([np.inf, -np.inf], np.nan)
+    
+    print("PcaMom因子计算完成")
+    
+    return pca_mom_factor
+
+
+def momentum_lead_lag_enhanced(prices_df, window, constituent_df, stock_price_df, stock_mv_df, industry_code_file, turnover_df, split_ratio=0.5, min_stocks=8):
+    """
+    龙头领先特征修正后的动量增强因子 (Lead-Lag Enhanced Momentum)
+    
+    出处：20180528-光大证券-《行业轮动：从动量谈起——技术指标系列报告之五》
+    
+    理念：
+    - 核心思想：动量不仅要看"涨了多少"（幅度），还要看"谁带头涨的"（内部结构）
+    - 龙头跟随效应（Lead-Lag Effect）：大市值龙头企业对行业基本面转好的反应速度快于小市值跟随企业
+    - 补涨逻辑：当龙头股率先拉升、跟随股尚未启动时，预示该行业未来还有"补涨"动力
+    - 去伪存真：如果上涨由小盘游资乱炒（龙头没动）或大小齐涨（补涨已完成），后续动量较弱
+    
+    构造：
+    - Lead_sector = Demean(R_Leader - R_Follower) / (σ_sector × Volume_sector)
+    - Factor = |Lead_sector| × R_sector
+    
+    其中：
+    - R_Leader: 行业内龙头股（前split_ratio市值）等权平均收益率
+    - R_Follower: 行业内跟随股（后1-split_ratio市值）等权平均收益率
+    - Demean: 截面去均值（减去全市场所有行业的平均差距）
+    - σ_sector: 行业内所有股票收益率的标准差（衡量内部同质化程度）
+    - Volume_sector: 行业的换手率/成交量（惩罚过热行业）
+    - R_sector: 行业指数本身的收益率
+    
+    信号解读：
+    - 绝对值的含义：无论正向差距（龙头领涨）还是负向差距（小票领涨导致的分化），
+      只要内部结构撕裂严重且行业总体在涨，就代表一种强动量
+    - 分母的作用：
+      - 除以标准差：如果行业内部乱作一团（标准差极大），信号不可靠，权重降低
+      - 除以成交量：缩量上涨时分母小，因子值暴增，代表"分歧小、反应未结束"的完美动量形态
+    
+    参数:
+        prices_df: pd.DataFrame, 行业指数价格数据 (index=日期, columns=行业)
+        window: int, 回溯窗口（交易日）
+        constituent_df: pd.DataFrame, 行业成分股数据（通过data_loader.load_constituent_df()加载）
+        stock_price_df: pd.DataFrame, 个股复权收盘价数据（通过data_loader.load_stock_price_df()加载）
+        stock_mv_df: pd.DataFrame, 个股流通市值数据（通过data_loader.load_stock_mv_df()加载）
+        industry_code_file: str, 申万行业指数代码映射文件路径
+        turnover_df: pd.DataFrame, 行业换手率数据（用于分母调整，通过data_loader.load_turnover_df()加载）
+        split_ratio: float, 龙头/跟随分割参数，默认0.5（前50%市值为龙头）
+        min_stocks: int, 最少成分股数量门槛，默认8
+    
+    返回:
+        pd.DataFrame, 龙头领先增强动量因子值，值越大表示动量越强
+    """
+    import os
+    
+    # ========== 第一阶段：数据准备 ==========
+    # 计算个股收益率
+    stock_returns_df = stock_price_df.pct_change(window)
+    
+    # ========== 第二阶段：构建行业名称到代码的映射 ==========
+    
+    industries = prices_df.columns.tolist()
+    
+    # 从申万行业指数CSV文件读取行业代码映射
+    if not os.path.exists(industry_code_file):
+        raise FileNotFoundError(f"行业代码映射文件不存在: {industry_code_file}")
+    
+    industry_code_df = pd.read_csv(industry_code_file)
+    
+    # 构建行业名称到代码的映射字典
+    sw_industry_codes = {}
+    for _, row in industry_code_df.iterrows():
+        code = row['申万一级行业代码']
+        name = row['申万一级行业名称']
+        if pd.notna(code) and pd.notna(name):
+            clean_name = name.replace('(申万)', '').replace('（申万）', '')
+            sw_industry_codes[clean_name] = code
+    
+    # 构建行业名称到代码的映射
+    industry_name_to_code = {}
+    for ind_name in industries:
+        clean_name = ind_name.replace('（申万）', '').replace('(申万)', '')
+        if clean_name in sw_industry_codes:
+            industry_name_to_code[ind_name] = sw_industry_codes[clean_name]
+    
+    # ========== 第三阶段：定义辅助函数 ==========
+    
+    def get_constituent_stocks_pit(industry_code, date, constituent_data):
+        """
+        获取指定行业在指定日期的成分股列表（Point-in-Time）
+        使用该日期之前最近的成分股数据
+        """
+        valid_dates = constituent_data[constituent_data['date'] <= date]['date'].unique()
+        if len(valid_dates) == 0:
+            return []
+        
+        latest_date = max(valid_dates)
+        mask = (constituent_data['date'] == latest_date) & (constituent_data['index_code'] == industry_code)
+        industry_constituents = constituent_data[mask]
+        
+        if len(industry_constituents) == 0:
+            return []
+        
+        return industry_constituents['wind_code'].tolist()
+    
+    def calculate_lead_lag_metrics(stock_codes, date, returns_df, mv_df, split_pct):
+        """
+        计算龙头领先指标的各项指标
         
         返回:
-            pd.Series, BSADF 统计量序列
+            tuple: (lead_return, follow_return, sector_std, n_valid_stocks)
+            - lead_return: 龙头组等权平均收益率
+            - follow_return: 跟随组等权平均收益率
+            - sector_std: 行业内所有股票收益率的标准差
+            - n_valid_stocks: 有效股票数量
         """
-        n = len(series)
-        bsadf_stats = pd.Series(index=series.index, dtype=float)
+        if date not in returns_df.index or date not in mv_df.index:
+            return np.nan, np.nan, np.nan, 0
         
-        for t in range(min_window, n):
-            max_adf_stat = -np.inf
-            
-            # 递归窗口：从 [0, t] 到 [t-min_window, t]
-            for s in range(0, t - min_window + 1):
-                window_data = series.iloc[s:t+1].dropna()
-                
-                if len(window_data) < min_window:
-                    continue
-                
-                try:
-                    # ADF 检验，返回 (adf_stat, pvalue, usedlag, nobs, critical_values, icbest)
-                    adf_result = adfuller(window_data, maxlag=1, regression='c', autolag=None)
-                    adf_stat = adf_result[0]
-                    
-                    if adf_stat > max_adf_stat:
-                        max_adf_stat = adf_stat
-                except Exception:
-                    continue
-            
-            if max_adf_stat > -np.inf:
-                bsadf_stats.iloc[t] = max_adf_stat
+        # 筛选有效的股票代码
+        valid_codes = [code for code in stock_codes 
+                       if code in returns_df.columns and code in mv_df.columns]
         
-        return bsadf_stats
+        if len(valid_codes) < 4:  # 至少需要4只股票才能分组
+            return np.nan, np.nan, np.nan, 0
+        
+        # 获取收益率和市值
+        returns = returns_df.loc[date, valid_codes]
+        market_values = mv_df.loc[date, valid_codes]
+        
+        # 构建数据框并清洗
+        data = pd.DataFrame({
+            'return': returns,
+            'mv': market_values
+        }).dropna()
+        
+        if len(data) < 4:
+            return np.nan, np.nan, np.nan, 0
+        
+        # 按市值排序（降序）
+        data = data.sort_values('mv', ascending=False)
+        
+        # 计算分割点
+        n_stocks = len(data)
+        n_leaders = max(1, int(n_stocks * split_pct))
+        
+        # 划分龙头组和跟随组
+        leaders = data.iloc[:n_leaders]
+        followers = data.iloc[n_leaders:]
+        
+        if len(followers) == 0:
+            return np.nan, np.nan, np.nan, 0
+        
+        # 计算等权平均收益率
+        lead_return = leaders['return'].mean()
+        follow_return = followers['return'].mean()
+        
+        # 计算行业内所有股票收益率的标准差
+        sector_std = data['return'].std()
+        
+        return lead_return, follow_return, sector_std, n_stocks
     
-    def get_bsadf_signal(weekly_close, weekly_amount, min_window, compare_window):
-        """
-        计算价量双重 BSADF 信号
+    # ========== 第四阶段：计算龙头领先指标 ==========
+    
+    # 初始化中间结果DataFrame
+    lead_return_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    follow_return_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    sector_std_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    
+    all_dates = prices_df.index.tolist()
+    total_dates = len(all_dates)
+    
+    print("正在计算龙头领先增强动量因子...")
+    
+    for i, date in enumerate(all_dates):
+        if i < window:
+            continue
         
-        条件：价格 BSADF > 中位数 且 成交额 BSADF > 中位数
-        """
-        industries = weekly_close.columns
-        signal_df = pd.DataFrame(index=weekly_close.index, columns=industries, dtype=float)
+        if i % 100 == 0:
+            print(f"  进度: {i}/{total_dates}")
         
-        for col in industries:
-            # 计算对数序列
-            log_close = np.log(weekly_close[col].dropna())
-            log_amount = np.log(weekly_amount[col].dropna() + 1)  # +1 避免 log(0)
-            
-            if len(log_close) < min_window + compare_window:
+        for ind_name in industries:
+            if ind_name not in industry_name_to_code:
                 continue
             
-            # 计算 BSADF 统计量
-            bsadf_price = calc_bsadf_stat(log_close, min_window)
-            bsadf_amount = calc_bsadf_stat(log_amount, min_window)
+            ind_code = industry_name_to_code[ind_name]
             
-            # 对齐索引
-            common_idx = bsadf_price.dropna().index.intersection(bsadf_amount.dropna().index)
+            # 获取当时的成分股（Point-in-Time）
+            stocks = get_constituent_stocks_pit(ind_code, date, constituent_df)
             
-            for t_idx, t in enumerate(common_idx):
-                if t_idx < compare_window:
-                    continue
-                
-                # 动态阈值：过去 compare_window 周的中位数
-                past_price = bsadf_price.loc[common_idx[:t_idx]].tail(compare_window)
-                past_amount = bsadf_amount.loc[common_idx[:t_idx]].tail(compare_window)
-                
-                if len(past_price) < compare_window or len(past_amount) < compare_window:
-                    continue
-                
-                median_price = past_price.median()
-                median_amount = past_amount.median()
-                
-                # 信号生成：双重确认
-                current_price = bsadf_price.loc[t]
-                current_amount = bsadf_amount.loc[t]
-                
-                if current_price > median_price and current_amount > median_amount:
-                    signal_df.loc[t, col] = 1
-                else:
-                    signal_df.loc[t, col] = 0
-        
-        return signal_df.fillna(0).astype(float)
-    
-    # ========== Phase 3: BOCD 变点检测 ==========
-    
-    def get_bocd_signal(weekly_returns, hazard, run_length_threshold):
-        """
-        计算 BOCD 变点检测信号
-        
-        条件1：最近3周变点概率单调递增
-        条件2：当周收益率 > 0
-        """
-        industries = weekly_returns.columns
-        signal_df = pd.DataFrame(index=weekly_returns.index, columns=industries, dtype=float)
-        change_prob_df = pd.DataFrame(index=weekly_returns.index, columns=industries, dtype=float)
-        
-        for col in industries:
-            returns = weekly_returns[col].dropna()
-            
-            if len(returns) < 10:
+            # 检查成分股数量门槛
+            if len(stocks) < min_stocks:
                 continue
             
-            # 初始化 BOCD 检测器
-            detector = GaussianBOCD(hazard=hazard)
+            # 计算龙头领先指标
+            lead_ret, follow_ret, std, n_stocks = calculate_lead_lag_metrics(
+                stocks, date, stock_returns_df, stock_mv_df, split_ratio
+            )
             
-            probs = []
-            for t, ret in enumerate(returns):
-                detector.update(ret)
-                prob = detector.get_change_prob(run_length_threshold)
-                probs.append(prob)
-                change_prob_df.loc[returns.index[t], col] = prob
-            
-            # 生成信号
-            for t in range(2, len(returns)):
-                t_date = returns.index[t]
-                
-                # 条件1：最近3周概率单调递增
-                prob_t = probs[t]
-                prob_t1 = probs[t-1]
-                prob_t2 = probs[t-2]
-                
-                monotonic_increase = (prob_t > prob_t1) and (prob_t1 > prob_t2)
-                
-                # 条件2：当周收益率 > 0
-                positive_return = returns.iloc[t] > 0
-                
-                if monotonic_increase and positive_return:
-                    signal_df.loc[t_date, col] = 1
-                else:
-                    signal_df.loc[t_date, col] = 0
-        
-        return signal_df.fillna(0).astype(float)
+            if n_stocks >= min_stocks:
+                lead_return_df.loc[date, ind_name] = lead_ret
+                follow_return_df.loc[date, ind_name] = follow_ret
+                sector_std_df.loc[date, ind_name] = std
     
-    # ========== Phase 4: 市场环境判断 ==========
+    # ========== 第五阶段：计算原始差距并截面去均值 ==========
     
-    def get_market_regime(weekly_returns, lookback):
-        """
-        判断市场状态
-        
-        - 熊市 (-1)：过去 lookback 周中至少 3 周平均收益 < 0
-        - 牛市 (1)：过去 lookback 周中至少 3 周平均收益 > 0
-        - 震荡 (0)：其他情况
-        """
-        # 计算全市场平均收益率
-        avg_returns = weekly_returns.mean(axis=1)
-        
-        regime = pd.Series(index=weekly_returns.index, dtype=int)
-        
-        for t in range(lookback, len(avg_returns)):
-            t_date = avg_returns.index[t]
-            past_returns = avg_returns.iloc[t-lookback:t]
-            
-            n_positive = (past_returns > 0).sum()
-            n_negative = (past_returns < 0).sum()
-            
-            if n_negative >= 3:
-                regime.loc[t_date] = -1  # 熊市
-            elif n_positive >= 3:
-                regime.loc[t_date] = 1   # 牛市
-            else:
-                regime.loc[t_date] = 0   # 震荡
-        
-        return regime
+    # 计算原始差距：龙头收益率 - 跟随收益率
+    raw_gap = lead_return_df - follow_return_df
     
-    # ========== Phase 5: 信号合成与风控 ==========
+    # 截面去均值：减去当日所有行业的平均差距
+    # 目的：剔除市场风格（如全市场都在炒大票）的影响
+    cross_sectional_mean = raw_gap.mean(axis=1)
+    demeaned_gap = raw_gap.sub(cross_sectional_mean, axis=0)
     
-    def apply_regime_filter(candidate_df, regime_series, weekly_returns,
-                            sim_lookback, top_n, threshold):
-        """
-        根据市场状态应用风控逻辑
-        
-        - 熊市：全员清仓
-        - 牛市：信号扩散（相似行业补涨）
-        - 震荡：维持原判
-        """
-        final_signal = candidate_df.copy()
-        industries = candidate_df.columns
-        
-        for t_date in candidate_df.index:
-            if t_date not in regime_series.index:
-                continue
-            
-            regime = regime_series.loc[t_date]
-            
-            if regime == -1:
-                # 熊市：全员清仓
-                final_signal.loc[t_date, :] = 0
-                
-            elif regime == 1:
-                # 牛市：信号扩散
-                # 计算行业间相似度
-                t_idx = weekly_returns.index.get_loc(t_date)
-                
-                if t_idx < sim_lookback:
-                    continue
-                
-                # 获取过去 sim_lookback 周的收益率
-                past_returns = weekly_returns.iloc[t_idx-sim_lookback:t_idx]
-                
-                # 转置后计算余弦相似度（行业 x 行业）
-                returns_matrix = past_returns.T.fillna(0).values
-                
-                if returns_matrix.shape[0] < 2:
-                    continue
-                
-                sim_matrix = cosine_similarity(returns_matrix)
-                sim_df = pd.DataFrame(sim_matrix, index=industries, columns=industries)
-                
-                # 对每个行业，找最相似的 top_n 个行业
-                current_candidate = candidate_df.loc[t_date]
-                
-                for ind in industries:
-                    if ind not in sim_df.index:
-                        continue
-                    
-                    # 获取最相似的 top_n 个行业（含自己）
-                    similar_industries = sim_df.loc[ind].nlargest(top_n).index.tolist()
-                    
-                    # 统计这些行业中有多少个 candidate = 1
-                    n_candidates = sum(current_candidate.get(sim_ind, 0) for sim_ind in similar_industries)
-                    
-                    # 如果超过阈值，强制置为 1
-                    if n_candidates > threshold:
-                        final_signal.loc[t_date, ind] = 1
-            
-            # regime == 0 (震荡)：维持原判，不做修改
-        
-        return final_signal
+    # ========== 第六阶段：计算Lead_sector ==========
     
-    # ========== 主流程执行 ==========
-    
-    # Step 1: 数据预处理
-    weekly_close, weekly_amount, weekly_returns = resample_to_weekly(prices_df, amount_df)
-    
-    # Step 2: 计算 BSADF 信号
-    signal_bsadf = get_bsadf_signal(weekly_close, weekly_amount,
-                                     bsadf_min_window, bsadf_compare_window)
-    
-    # Step 3: 计算 BOCD 信号
-    signal_bocd = get_bocd_signal(weekly_returns, bocd_hazard, bocd_run_length_threshold)
-    
-    # Step 4: 生成初始候选
-    # Candidate = (BSADF == 1 OR BOCD == 1) AND (Return > 0)
-    signal_union = ((signal_bsadf == 1) | (signal_bocd == 1)).astype(float)
-    positive_return_mask = (weekly_returns > 0).astype(float)
-    
+    # 分母处理：标准差 × 成交量
+    # 使用换手率作为成交量代理
     # 对齐索引
-    common_index = signal_union.index.intersection(positive_return_mask.index)
-    signal_union = signal_union.loc[common_index]
-    positive_return_mask = positive_return_mask.loc[common_index]
+    turnover_aligned = turnover_df.reindex(index=prices_df.index, columns=prices_df.columns)
+    # 计算窗口期平均换手率
+    avg_turnover = turnover_aligned.rolling(window=window).mean()
+    # 分母 = 标准差 × 换手率
+    denominator = sector_std_df * avg_turnover
     
-    candidate = (signal_union * positive_return_mask).fillna(0)
+    # 避免除以零
+    denominator = denominator.replace(0, np.nan)
     
-    # Step 5: 计算市场状态
-    regime = get_market_regime(weekly_returns, regime_lookback)
+    # 计算Lead_sector
+    lead_score = demeaned_gap / denominator
     
-    # Step 6: 应用风控逻辑
-    final_factor = apply_regime_filter(candidate, regime, weekly_returns,
-                                        similarity_lookback, similarity_top_n,
-                                        similarity_threshold)
+    # 处理无穷大值
+    lead_score = lead_score.replace([np.inf, -np.inf], np.nan)
     
-    return final_factor.astype(float)
-
+    # ========== 第七阶段：计算最终因子值 ==========
+    
+    # 计算行业收益率
+    sector_returns = prices_df.pct_change(window)
+    
+    # 最终因子 = |Lead_sector| × R_sector
+    # 取绝对值：无论龙头领涨还是小票领涨，只要分化严重且行业在涨，都是强动量信号
+    factor_df = lead_score.abs() * sector_returns
+    
+    # 处理无穷大和NaN
+    factor_df = factor_df.replace([np.inf, -np.inf], np.nan)
+    
+    print("龙头领先增强动量因子计算完成")
+    
+    return factor_df
 
