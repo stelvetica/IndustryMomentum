@@ -21,27 +21,38 @@ DEFAULT_STOCK_MV_FILE = "data/个股_流通市值.csv"
 DEFAULT_INDUSTRY_CODE_FILE = "data/申万行业指数.csv"
 
 
-def load_raw_data(file_path=DEFAULT_CACHE_FILE):
+# 缓存已加载的原始数据，避免重复加载
+_raw_data_cache = {}
+
+def load_raw_data(file_path=DEFAULT_CACHE_FILE, verbose=True):
     """
     加载原始数据（pickle格式）
-    
+
     参数:
     file_path: str, 数据文件路径
-    
+    verbose: bool, 是否打印加载信息（默认True，但缓存命中时不打印）
+
     返回:
     dict: 包含 'data', 'industry_info', 'download_time', 'columns' 的字典
     """
+    # 检查缓存
+    if file_path in _raw_data_cache:
+        return _raw_data_cache[file_path]
+
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"数据文件不存在: {file_path}")
-    
+
     with open(file_path, 'rb') as f:
         data_store = pickle.load(f)
-    
-    df = data_store['data']
-    n_industries = df['代码'].nunique()
-    print(f"已加载 {n_industries} 个行业的数据")
-    print(f"日期范围: {df['日期'].min()} 至 {df['日期'].max()}")
-    
+
+    # 缓存数据
+    _raw_data_cache[file_path] = data_store
+
+    if verbose:
+        df = data_store['data']
+        n_industries = df['代码'].nunique()
+        print(f"  行业指数: 行[{df['日期'].min()} - {df['日期'].max()}] 列[{n_industries}个行业]")
+
     return data_store
 
 
@@ -210,81 +221,75 @@ def load_constituent_df(file_path=DEFAULT_CONSTITUENT_FILE):
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"成分股数据文件不存在: {file_path}")
-    
-    df = pd.read_csv(file_path)
+
+    df = pd.read_csv(file_path, low_memory=False)
     df['date'] = pd.to_datetime(df['date'])
-    
-    print(f"已加载成分股数据")
-    print(f"日期范围: {df['date'].min().date()} 至 {df['date'].max().date()}")
-    print(f"行业数量: {df['index_code'].nunique()}")
-    
+
+    print(f"  成分股: 行[{df['date'].min().date()} - {df['date'].max().date()}] 列[{df['index_code'].nunique()}个行业]")
+
     return df
 
 
 def load_stock_price_df(file_path=DEFAULT_STOCK_PRICE_FILE):
     """
     加载个股复权收盘价数据
-    
+
     参数:
     file_path: str, 个股价格数据文件路径
-    
+
     返回:
     pd.DataFrame: 个股价格数据框 (index=日期, columns=股票代码)
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"个股价格数据文件不存在: {file_path}")
-    
+
     df = pd.read_csv(file_path, index_col=0)
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
-    
-    print(f"已加载个股价格数据")
-    print(f"日期范围: {df.index[0].date()} 至 {df.index[-1].date()}")
-    print(f"股票数量: {len(df.columns)}")
-    
+
+    print(f"  个股价格: 行[{df.index[0].date()} - {df.index[-1].date()}] 列[{len(df.columns)}只股票]")
+
     return df
 
 
 def load_stock_mv_df(file_path=DEFAULT_STOCK_MV_FILE):
     """
     加载个股流通市值数据
-    
+
     参数:
     file_path: str, 个股流通市值数据文件路径
-    
+
     返回:
     pd.DataFrame: 个股流通市值数据框 (index=日期, columns=股票代码)
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"个股流通市值数据文件不存在: {file_path}")
-    
+
     df = pd.read_csv(file_path, index_col=0)
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
-    
-    print(f"已加载个股流通市值数据")
-    print(f"日期范围: {df.index[0].date()} 至 {df.index[-1].date()}")
-    print(f"股票数量: {len(df.columns)}")
-    
+
+    print(f"  个股市值: 行[{df.index[0].date()} - {df.index[-1].date()}] 列[{len(df.columns)}只股票]")
+
     return df
 
 
 def load_barra_factor_returns(file_path=DEFAULT_BARRA_FILE):
     """
     加载 Barra 风格因子日频收益率数据
-    
+
     数据来源：Barra CNE5/CNE6 模型的风格因子收益率
     用途：用于行业残差动量因子的计算，剥离市场和风格因素
-    
+
     参数:
     file_path: str, Barra因子数据文件路径（Excel格式）
-    
+
     返回:
     pd.DataFrame: Barra因子收益率数据框
         - index: 日期 (DatetimeIndex)
-        - columns: 因子名称 (市场, Size, Beta, Momentum, ResidualVolatility, 
+        - columns: 因子名称 (市场, Size, Beta, Momentum, ResidualVolatility,
                    NonlinearSize, BookToPrice, Liquidity, EarningsYield, Growth, Leverage)
-    
+
     注意:
     - 返回的是因子收益率 (Factor Return)，而非因子载荷 (Factor Exposure)
     - 市场因子代表大盘整体涨跌
@@ -292,20 +297,18 @@ def load_barra_factor_returns(file_path=DEFAULT_BARRA_FILE):
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Barra因子数据文件不存在: {file_path}")
-    
+
     # 读取Excel文件
     df = pd.read_excel(file_path)
-    
+
     # 第一列是日期，重命名并设置为索引
     df = df.rename(columns={'Unnamed: 0': '日期'})
     df['日期'] = pd.to_datetime(df['日期'])
     df = df.set_index('日期')
     df = df.sort_index()
-    
-    print(f"已加载 Barra 因子数据")
-    print(f"日期范围: {df.index[0].date()} 至 {df.index[-1].date()}")
-    print(f"因子列表: {df.columns.tolist()}")
-    
+
+    print(f"  Barra因子: 行[{df.index[0].date()} - {df.index[-1].date()}] 列[{len(df.columns)}个因子]")
+
     return df
 
 
@@ -325,12 +328,9 @@ def load_industry_code_df(file_path=DEFAULT_INDUSTRY_CODE_FILE):
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"行业代码映射文件不存在: {file_path}")
-    
+
     df = pd.read_csv(file_path)
-    
-    print(f"已加载行业代码映射数据")
-    print(f"行业数量: {len(df)}")
-    
+
     return df
 
 

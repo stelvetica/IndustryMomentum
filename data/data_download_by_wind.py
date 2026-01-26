@@ -37,7 +37,7 @@ def download_industry_data(start_date, end_date):
     print("Wind API连接成功！")
     
     # 读取申万行业指数CSV文件
-    csv_path = "申万行业指数.csv"
+    csv_path = "data/申万行业指数.csv"
     if not os.path.exists(csv_path):
         print(f"错误：找不到文件 {csv_path}")
         w.stop()
@@ -127,7 +127,7 @@ def download_industry_data(start_date, end_date):
     
     return combined_df, industry_df
 
-def save_data(combined_df, industry_df, output_path="sw_industry_data.pkl"):
+def save_data(combined_df, industry_df, output_path="data/sw_industry_data.pkl"):
     """
     保存数据为pkl格式
     
@@ -166,23 +166,22 @@ def save_data(combined_df, industry_df, output_path="sw_industry_data.pkl"):
 
 if __name__ == "__main__":
     # ========== 日期参数配置 ==========
-    START_DATE = "2016-01-01"  # 数据起始日期
+    START_DATE = "2010-01-01"  # 数据起始日期
     END_DATE = "2026-01-13"    # 数据截止日期
     # =================================
 
     # ========== 下载数据 ==========
     # 取消下面的注释来下载数据
-    """
+    '''
     result = download_industry_data(start_date=START_DATE, end_date=END_DATE)
     
     if result is not None:
         combined_df, industry_df = result
         # 保存数据
         save_data(combined_df, industry_df)
-    
-    """
+    '''
     # ========== 测试：加载和查询数据 ==========
-    file_path = "sw_industry_data.pkl"
+    file_path = "data/sw_industry_data.pkl"
     
     # 加载数据
     if os.path.exists(file_path):
