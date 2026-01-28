@@ -16,10 +16,10 @@ import factors_analysis as fa
 # ============================================================
 
 # 要测试的因子名称（必须在 factors_analysis.FACTOR_CONFIG 中定义）
-FACTOR_NAME = 'momentum_lead_lag_enhanced'
+FACTOR_NAME = None
 
 # 截止日期（None 表示使用最新数据）
-END_DATE = '2024-12-31'     # 格式: '2022-11-30' 或 None
+END_DATE = None     # 格式: '2022-11-30' 或 None
 
 # ============================================================
 # 调用组装 - 无需修改
@@ -76,7 +76,7 @@ def run_analysis(factor_name, end_date=None):
 
     # 导出到Excel（时间戳和耗时在导出时生成）
     print("\n正在导出到Excel...")
-    output_file = fa.get_output_path(factor_name, duration_str)
+    output_file = fa.get_output_path(factor_name, duration_str, end_date)
     fa.export_to_excel(all_results, output_file, windows)
 
     # 格式化Excel报告
@@ -107,5 +107,14 @@ def run_analysis(factor_name, end_date=None):
 
 
 if __name__ == "__main__":
-    run_analysis(FACTOR_NAME, END_DATE)
-
+    #run_analysis('momentum_lead_lag_enhanced', '2021-12-31') # 研报截止日期
+    #run_analysis('momentum_lead_lag_enhanced', None) # 最新时间
+    #run_analysis('momentum_pca', '2024-02-29')
+    #run_analysis('momentum_pca', None)
+    #run_analysis('momentum_residual', '2022-02-28')
+    #run_analysis('momentum_residual', None)
+    #run_analysis('momentum_cross_industry_lasso', '2022-11-30')
+    #run_analysis('momentum_cross_industry_lasso', None)
+    #run_analysis('momentum_industry_component', '2022-11-02')  # 研报截止日期
+    run_analysis('momentum_industry_component', None)  # 最新数据
+    

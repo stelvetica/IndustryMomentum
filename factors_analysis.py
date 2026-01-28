@@ -127,11 +127,11 @@ FACTOR_CONFIG = {
     },
     'momentum_residual': {
         'func': factor_.momentum_residual,
-        'base_warmup': 0,
-        'window_multiplier': 1,  # 直接使用交易日数
-        'lookback_windows': [60, 120, 240, 480],  # 交易日数：约12/18/24个月
+        'base_warmup': 240,  # 12个月月度数据预热（约240交易日）
+        'window_multiplier': 0,  # 研报固定使用12个月，不依赖window参数
+        'lookback_windows': [240],  # 固定窗口，研报使用12个月回看
         'requires_constituent': False,
-        'description': '特质动量2-2-行业残差动量因子Barra（日频回归）'
+        'description': '特质动量2-2-行业残差动量因子Barra兴业'
     },
 
     # ===== 行业间相关性动量因子 =====
@@ -139,7 +139,7 @@ FACTOR_CONFIG = {
         'func': factor_.momentum_cross_industry_lasso,
         'base_warmup': 200,
         'window_multiplier': 1,
-        'lookback_windows': None,
+        'lookback_windows': [20],
         'requires_constituent': False,
         'description': '行业间动量1-1-Lasso因子'
     },
@@ -147,11 +147,11 @@ FACTOR_CONFIG = {
     # ===== 行业内关系动量因子（需要成分股数据）=====
     'momentum_industry_component': {
         'func': factor_.momentum_industry_component,
-        'base_warmup': 0,
-        'window_multiplier': 1,
-        'lookback_windows': None,
+        'base_warmup': 0,  # 无额外固定预热期
+        'window_multiplier': 20,  # window是月数，预热期 = window * 20（交易日）
+        'lookback_windows': [1, 3, 6, 12, 24, 36],  # 月数（研报原文：1、3、6、12、24、36个月）
         'requires_constituent': True,
-        'description': '行业内动量1-3-行业成分股动量因子（一致性上涨）'
+        'description': '行业内动量1-3-行业成分股动量因子 东方'
     },
     'momentum_pca': {
         'func': factor_.momentum_pca,
@@ -166,32 +166,42 @@ FACTOR_CONFIG = {
         'func': factor_.momentum_lead_lag_enhanced,
         'base_warmup': 0,
         'window_multiplier': 1,
-        'lookback_windows': None,
+        'lookback_windows': None,  # 原文固定使用20日窗口（1个月）
         'requires_constituent': True,
+        'default_split_ratio': 0.1,  # 最优分割参数（测试结果：0.4表现最好）
         'description': '行业内动量3-3-龙头领先修正动量因子'
     },
 }
 
-def get_output_path(factor_name=None, duration_str=None):
+def get_output_path(factor_name=None, duration_str=None, end_date=None):
     """
     获取输出文件路径
 
     参数:
     factor_name: str 或 list, 因子名称。
-        - 如果是单个因子名称（str），文件名为 因子description_时间戳_耗时.xlsx
-        - 如果是多个因子（list）或 None，文件名为 因子统一分析_时间戳_耗时.xlsx
+        - 如果是单个因子名称（str），文件名为 因子description_截止日期_时间戳_耗时.xlsx
+        - 如果是多个因子（list）或 None，文件名为 因子统一分析_截止日期_时间戳_耗时.xlsx
     duration_str: str, 计算耗时字符串，如 "1h30m" 或 "45m"
+    end_date: str, 截止日期，格式为 'YYYY-MM-DD'，None表示使用"最新"
 
     返回:
-    str: 完整的输出文件路径，格式为 factor分析/因子description_YYYYMMDD_HHMMSS_耗时.xlsx
+    str: 完整的输出文件路径，格式为 factor分析/因子description_截止日期_HHMMSS_耗时.xlsx
     """
     # 确保输出文件夹存在
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         print(f"已创建输出文件夹: {OUTPUT_DIR}")
 
-    # 生成时间戳
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # 生成时间戳（只保留小时分秒）
+    timestamp = datetime.now().strftime('%H%M%S')
+
+    # 处理截止日期
+    if end_date:
+        # 将 'YYYY-MM-DD' 格式转换为 'xx年xx月截止'
+        parts = end_date.split('-')
+        end_date_str = f"{parts[0]}年{parts[1]}月截止"
+    else:
+        end_date_str = "最新"
 
     # 确定因子名称（使用description）
     if factor_name is None:
@@ -214,11 +224,11 @@ def get_output_path(factor_name=None, duration_str=None):
     else:
         name_prefix = "因子统一分析"
 
-    # 生成文件名：因子description_时间戳_耗时.xlsx
+    # 生成文件名：因子description_截止日期_时间戳_耗时.xlsx
     if duration_str:
-        filename = f"{name_prefix}_{timestamp}_{duration_str}.xlsx"
+        filename = f"{name_prefix}_{end_date_str}_{timestamp}_{duration_str}.xlsx"
     else:
-        filename = f"{name_prefix}_{timestamp}.xlsx"
+        filename = f"{name_prefix}_{end_date_str}_{timestamp}.xlsx"
 
     return os.path.join(OUTPUT_DIR, filename)
 
@@ -674,7 +684,7 @@ def calculate_factor_unified_start_date(data: 'DataContainer', factor_name, wind
     return unified_start_date, max_warmup, max_warmup_window
 
 
-def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ):
+def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, split_ratio=None):
     """
     计算单个因子值
 
@@ -683,6 +693,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
     data: DataContainer, 数据容器（包含所有需要的数据）
     window: int, 回溯窗口
     rebalance_freq: int, 调仓频率
+    split_ratio: float, 龙头/跟随分割参数（仅用于momentum_lead_lag_enhanced因子）
 
     返回:
     pd.DataFrame: 因子值
@@ -699,7 +710,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
     factor_func = factor_config['func']
     sig = inspect.signature(factor_func)
     param_names = list(sig.parameters.keys())
-    
+
     # 计算基准收益率（用于需要的因子）
     benchmark_returns = calculate_benchmark_returns(data.prices_df, rebalance_freq)
 
@@ -725,7 +736,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         'zscore_window': 240,
         'smooth_window': 3,
         'min_industries': 15,
-        'train_periods': None,
+        'train_periods': 60,
         'benchmark_returns': benchmark_returns,
         # PCA因子参数（根据兴业研报《分歧和共振》设置）
         # pca_window: 120天（研报第8页："过去n天（在这里设定为120天）涨跌幅"）
@@ -736,7 +747,13 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         'industry_prices_df': data.prices_df,
         'barra_factor_returns_df': data.barra_factor_returns_df,
     }
-    
+
+    # 如果指定了split_ratio，添加到参数字典；否则从配置中读取default_split_ratio
+    if split_ratio is not None:
+        available_params['split_ratio'] = split_ratio
+    elif 'default_split_ratio' in factor_config:
+        available_params['split_ratio'] = factor_config['default_split_ratio']
+
     # 根据函数签名自动选择参数
     call_kwargs = {}
     for param_name in param_names:
@@ -746,7 +763,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
             param = sig.parameters[param_name]
             if param.default is inspect.Parameter.empty:
                 raise ValueError(f"因子 '{factor_name}' 需要参数 '{param_name}'，但未定义。")
-    
+
     return factor_func(**call_kwargs)
 
 
@@ -1435,10 +1452,10 @@ def calculate_yearly_returns(nav_df, benchmark_nav, start_year=None, last_comple
     return pd.DataFrame(yearly_data)
 
 
-def analyze_single_factor_window(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, unified_start_date=None):
+def analyze_single_factor_window(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, unified_start_date=None, split_ratio=None):
     """
     分析单个因子在单个窗口下的表现
-    
+
     参数:
     factor_name: str, 因子名称
     data: DataContainer, 数据容器
@@ -1446,7 +1463,8 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     rebalance_freq: int, 调仓频率（仅在非月度调仓时使用）
     monthly_rebalance: bool, 是否按月调仓，默认为 True
     unified_start_date: pd.Timestamp, 统一的回测起始日期（如果指定，所有因子从该日期开始回测）
-    
+    split_ratio: float, 龙头/跟随分割参数（仅用于momentum_lead_lag_enhanced因子）
+
     返回:
     dict: 包含IC/IR、分层指标、持仓等信息
     """
@@ -1454,13 +1472,13 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     factor_rebalance_type = None
     if factor_name in FACTOR_CONFIG:
         factor_rebalance_type = FACTOR_CONFIG[factor_name].get('rebalance_type', None)
-    
+
     # 如果因子配置了特定的调仓类型，使用该类型
     if factor_rebalance_type is not None:
         print(f"    使用因子配置的调仓类型: {factor_rebalance_type}")
-    
-    # 计算因子值
-    factor_df = compute_factor(factor_name, data, window, rebalance_freq)
+
+    # 计算因子值（传入split_ratio参数）
+    factor_df = compute_factor(factor_name, data, window, rebalance_freq, split_ratio=split_ratio)
     
     # 获取最后一个完整月末日期（用于排除不完整月份的收益计算）
     last_complete_month_end = None
@@ -1591,7 +1609,7 @@ def analyze_single_factor(factor_name, data: DataContainer, windows=LOOKBACK_WIN
     use_unified_start_date: bool, 是否使用统一的回测起始日期，默认为 True
 
     返回:
-    dict: {factor_name: {window: analysis_result}}
+    dict: {factor_name: {window: analysis_result}} 或 {factor_name: {(window, split_ratio): analysis_result}}
     """
     if factor_name not in FACTOR_CONFIG:
         raise ValueError(f"因子 '{factor_name}' 不存在，可用因子: {list(FACTOR_CONFIG.keys())}")
@@ -1599,8 +1617,14 @@ def analyze_single_factor(factor_name, data: DataContainer, windows=LOOKBACK_WIN
     # 获取该因子适用的窗口列表
     factor_windows = get_factor_windows(factor_name, windows)
 
+    # 获取该因子的split_ratios配置（如果有）
+    factor_config = FACTOR_CONFIG[factor_name]
+    split_ratios = factor_config.get('split_ratios', None)
+
     print(f"\n正在分析因子: {factor_name}")
     print(f"  适用窗口: {factor_windows}")
+    if split_ratios:
+        print(f"  分割参数: {split_ratios}")
     factor_results = {}
 
     # 获取 DataContainer 中的 first_holding_date（如果有）
@@ -1632,18 +1656,36 @@ def analyze_single_factor(factor_name, data: DataContainer, windows=LOOKBACK_WIN
             print(f"  计算统一起始日期失败: {e}")
             factor_unified_start_date = None
 
-    # 计算每个窗口
-    for window in factor_windows:
-        print(f"  窗口: {window}日...")
-        try:
-            result = analyze_single_factor_window(
-                factor_name, data, window, rebalance_freq, monthly_rebalance=monthly_rebalance,
-                unified_start_date=factor_unified_start_date
-            )
-            factor_results[window] = result
-        except Exception as e:
-            print(f"    错误: {e}")
-            factor_results[window] = None
+    # 如果有split_ratios配置，遍历所有(window, split_ratio)组合
+    if split_ratios:
+        for window in factor_windows:
+            for split_ratio in split_ratios:
+                key = (window, split_ratio)
+                print(f"  窗口: {window}日, 分割参数: {split_ratio}...")
+                try:
+                    result = analyze_single_factor_window(
+                        factor_name, data, window, rebalance_freq, monthly_rebalance=monthly_rebalance,
+                        unified_start_date=factor_unified_start_date, split_ratio=split_ratio
+                    )
+                    factor_results[key] = result
+                except Exception as e:
+                    print(f"    错误: {e}")
+                    factor_results[key] = None
+    else:
+        # 没有split_ratios配置，按原来的方式遍历窗口
+        # 如果有default_split_ratio配置，使用该值
+        default_split_ratio = factor_config.get('default_split_ratio', None)
+        for window in factor_windows:
+            print(f"  窗口: {window}日...")
+            try:
+                result = analyze_single_factor_window(
+                    factor_name, data, window, rebalance_freq, monthly_rebalance=monthly_rebalance,
+                    unified_start_date=factor_unified_start_date, split_ratio=default_split_ratio
+                )
+                factor_results[window] = result
+            except Exception as e:
+                print(f"    错误: {e}")
+                factor_results[window] = None
 
     return {factor_name: factor_results}
 
@@ -2837,7 +2879,7 @@ if __name__ == "__main__":
     duration_str = f"{hours}h{minutes:02d}m" if hours > 0 else f"{minutes}m"
 
     # 获取输出路径（使用 get_output_path）
-    output_file = get_output_path(None, duration_str)
+    output_file = get_output_path(None, duration_str, end_date)
 
     # 导出到Excel（包含相关性分析结果）
     print("\n正在导出到Excel...")

@@ -931,23 +931,21 @@ def momentum_pure_liquidity_stripped(prices_df, turnover_df, window=20,
 
 def momentum_residual(industry_prices_df, barra_factor_returns_df, window):
     """
-    行业残差动量因子 (Industry Residual Momentum) - 日频回归版本
+    行业残差动量因子 (Industry Residual Momentum) - 严格按兴业证券研报实现
 
     出处：兴业证券《基于盈余惊喜(基本面)、残差动量(技术面)、北向资金(资金流)的行业轮动模型》2022年3月27日
     核心引用：Blitz, Huij, and Martens (2011) - Residual Momentum
 
     理念：
-    - 传统动量存在"动量崩溃"风险，在市场由熊转牛时容易踏空
-    - 涨跌幅 = 大盘环境(Beta) + 风格运气(Style) + 自身实力(Alpha/Residual)
-    - 残差动量剥离市场和风格因素，只保留行业"特质性"收益
-    - 寻找"无论大盘和风格如何变动，凭借自身逻辑依然表现强势"的行业
+    - 传统动量存在"动量崩溃"风险，对策略构造期表现较好的因子有较高风险敞口
+    - 如果这些因子在持有期出现反转，普通的动量策略就有可能失效
+    - 残差动量通过回归先剥离风险因素的影响，再使用残差构造动量策略
 
-    构造（严格按研报原文 + Blitz 2011）：
-    1. 使用日频数据进行时间序列OLS回归（保证统计显著性）
-    2. 对每个行业，用过去 window 个交易日的日频数据回归：
-       R_{i,t} = α_i + Σ(β_{i,k} * F_{k,t}) + ε_{i,t}
-    3. 因子值 = α / σ_ε （信息比率形式，即截距的 t-statistic）
-       这代表该行业在剥离风格后，上涨趋势的"显著性"
+    构造（严格按研报原文）：
+    1. 将每个月的各行业指数收益率对 Barra 因子进行滚动回归（回看 12 个月）
+    2. 将回归后得到的**当月残差**作为该行业当月的残差动量
+
+    注意：研报使用月度数据进行回归，回看窗口固定为12个月
 
     参数:
         industry_prices_df: pd.DataFrame, 行业日频价格 (index=日期, columns=行业)
@@ -955,94 +953,115 @@ def momentum_residual(industry_prices_df, barra_factor_returns_df, window):
             - index: 日期
             - columns: 因子名称 (市场, Size, Beta, Momentum, ResidualVolatility,
                        NonlinearSize, BookToPrice, Liquidity, EarningsYield, Growth, Leverage)
-        window: int, 回溯窗口（交易日数），研报推荐252/378/504（约12/18/24个月）
+        window: int, 回溯窗口（交易日数），会转换为月数（window/20约等于月数）
+                研报固定使用12个月回看窗口
 
     返回:
         pd.DataFrame, 残差动量因子值（日频，月末更新），值越大表示特质动量越强
     """
     import statsmodels.api as sm
 
-    # ========== Phase 1: 数据准备（日频）==========
+    # ========== Phase 1: 数据准备（月度数据） ==========
+    # 研报原文："将每个月的各行业指数收益率对 Barra 因子进行滚动回归（回看 12 个月）"
+    # 使用月度数据进行回归，回看12个月，不加常数项
+    # 因子值 = 当月残差（实际月度收益 - 风格因子解释的收益）
+    #
+    # 注意：研报使用中信一级行业（28个），本代码使用申万一级行业（30个）
 
-    # 行业日频收益率
-    industry_returns_daily = industry_prices_df.pct_change()
+    # 获取每月最后一个交易日的日期
+    trade_dates = industry_prices_df.index
+    monthly_last = trade_dates.to_series().groupby(
+        [trade_dates.year, trade_dates.month]
+    ).apply(lambda x: x.iloc[-1])
+    monthly_last = pd.DatetimeIndex(monthly_last)
 
-    # 确保日期索引对齐
-    common_dates = industry_returns_daily.index.intersection(barra_factor_returns_df.index)
-    industry_returns_daily = industry_returns_daily.loc[common_dates].copy()
-    barra_returns_daily = barra_factor_returns_df.loc[common_dates].copy()
+    # 行业月末价格和月度收益率
+    industry_prices_monthly = industry_prices_df.loc[monthly_last]
+    industry_returns_monthly = industry_prices_monthly.pct_change()
 
-    # 直接使用传入的交易日数作为回看窗口
-    lookback_days = window
+    # Barra因子月度收益率（日度累乘转月度）
+    barra_daily = barra_factor_returns_df.copy()
+    barra_daily['year_month'] = barra_daily.index.to_period('M')
+    
+    def compound_returns(group):
+        return (1 + group).prod() - 1
+    
+    barra_numeric = barra_daily.drop(columns=['year_month'])
+    barra_numeric['year_month'] = barra_daily['year_month']
+    barra_monthly = barra_numeric.groupby('year_month').apply(
+        lambda x: compound_returns(x.drop(columns=['year_month']))
+    )
+    barra_monthly.index = pd.to_datetime([str(p) for p in barra_monthly.index], format='%Y-%m') + pd.offsets.MonthEnd(0)
+    
+    # 对齐月度索引
+    common_months = industry_returns_monthly.index.intersection(barra_monthly.index)
+    industry_returns_monthly = industry_returns_monthly.loc[common_months].copy()
+    barra_monthly = barra_monthly.loc[common_months].copy()
 
-    # 获取月末日期列表（用于月度更新因子）
-    month_ends = industry_returns_daily.resample('ME').last().index
-    month_ends = month_ends[month_ends.isin(common_dates)]
+    # 回看窗口：12个月
+    lookback_months = 12
 
-    # ========== Phase 2: 日频滚动回归（月末更新）==========
+    # ========== Phase 2: 月度因子计算 ==========
 
-    industries = industry_returns_daily.columns.tolist()
+    industries = industry_returns_monthly.columns.tolist()
+    month_list = common_months.tolist()
 
     # 初始化月频因子值DataFrame
-    factor_monthly = pd.DataFrame(index=month_ends,
+    factor_monthly = pd.DataFrame(index=common_months,
                                   columns=industries,
                                   dtype=float)
 
-    # 最少需要的日度观测值（因子数 + 常数项 + 足够自由度）
-    n_factors = len(barra_returns_daily.columns)
-    min_obs = max(n_factors + 10, 60)  # 至少60个交易日，保证统计显著性
+    # 最少需要的观测值：不加常数项，11个因子需要至少12个观测
+    n_factors = len(barra_monthly.columns)
+    min_obs = n_factors + 1  # 11因子 + 1自由度 = 12
 
-    # 对每个月末日期计算因子
-    for month_end in month_ends:
-        # 找到该月末在日期序列中的位置
-        try:
-            end_loc = common_dates.get_loc(month_end)
-        except KeyError:
-            continue
-
+    success_count = 0
+    fail_count = 0
+    skip_lookback = 0
+    skip_min_obs = 0
+    
+    for i, current_month in enumerate(month_list):
         # 确保有足够的历史数据
-        if end_loc < lookback_days:
+        if i < lookback_months:
+            skip_lookback += 1
             continue
 
-        # 截取窗口期内的日频数据
-        start_loc = end_loc - lookback_days + 1
-        window_dates = common_dates[start_loc:end_loc + 1]
-
-        X = barra_returns_daily.loc[window_dates]
-
+        # 截取回看窗口内的月度数据（包含当月）
+        window_months = month_list[i - lookback_months + 1:i + 1]
+        
+        X = barra_monthly.loc[window_months]
+        
         # 对每个行业进行回归
         for col in industries:
-            y = industry_returns_daily.loc[window_dates, col]
+            y = industry_returns_monthly.loc[window_months, col]
 
             # 数据对齐和清洗
             valid_mask = y.notna() & X.notna().all(axis=1)
             y_valid = y[valid_mask]
             X_valid = X[valid_mask]
 
-            # 至少需要一定数量的有效数据点
             if len(y_valid) < min_obs:
+                skip_min_obs += 1
                 continue
 
             try:
-                # OLS回归，添加常数项
-                X_with_const = sm.add_constant(X_valid)
-                model = sm.OLS(y_valid, X_with_const).fit()
+                # OLS回归，不加常数项
+                model = sm.OLS(y_valid, X_valid).fit()
 
-                # ========== 研报原文方法（Blitz 2011）==========
-                # 因子值 = α / σ_ε （信息比率形式）
-                # 即截距项除以残差标准差，等价于截距的 t-statistic
-                alpha = model.params.get('const', 0)
-                resid_std = model.resid.std()
-
-                if resid_std > 0:
-                    factor_value = alpha / resid_std
-                else:
-                    factor_value = np.nan
-
-                factor_monthly.loc[month_end, col] = factor_value
+                # 当月残差 = 特质动量
+                current_month_residual = model.resid.iloc[-1]
+                
+                factor_monthly.loc[current_month, col] = current_month_residual
+                success_count += 1
 
             except Exception:
+                fail_count += 1
                 continue
+
+    # 输出统计信息
+    print(f'  残差动量: 成功{success_count}次, 失败{fail_count}次, 月份数{len(monthly_last)}, 行业数{len(industries)}')
+    print(f'  跳过: lookback={skip_lookback}月, min_obs={skip_min_obs}次')
+    print(f'  factor_monthly非空值: {factor_monthly.notna().sum().sum()}')
 
     # ========== Phase 3: 月频因子值扩展到日频 ==========
     factor_daily = pd.DataFrame(index=industry_prices_df.index,
@@ -1073,107 +1092,156 @@ def momentum_residual(industry_prices_df, barra_factor_returns_df, window):
 """
 行业间相关性动量因子
 """
-def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_returns, train_periods=36):
+def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_returns=None, train_periods=36):
     """
-    行业间相关性动量因子（基于Lasso回归的领先滞后关系）
+    行业间相关性动量因子（基于Lasso回归的领先滞后关系）- 严格按研报逻辑的月频实现。
     
-    出处：20221201-东方证券-《量化策略研究之六》：行业动量的刻画
+    出处：《行业动量的刻画——量化策略研究之六》的东方证券研究报告，2022年12月01日
     
-    理念：利用行业间经济联系（上下游、替代品、宏观周期）预测目标行业未来表现。
-          Lasso的L1正则化自动筛选有预测力的行业，避免过拟合。
-    构造：用各行业历史超额收益作为特征，Lasso回归预测目标行业未来超额收益。
-    
+    研报原文要点：
+        - 使用月度数据（每月最后一个交易日）
+        - 自变量：所有行业“上月”的超额收益率（相对于行业等权基准）
+        - 因变量：目标行业“下月”的超额收益率
+        - 对每个行业单独做 Lasso 时间序列回归，使用 AIC 选择正则化强度
+        - 每月底用历史样本训练模型，代入当月最新的“上月超额收益”得到下月预测值
+
+    在本实现中：
+        - 我们以“月末日期 months[s]”作为回测调仓日，对应持有区间 [months[s], months[s+1]]
+        - 对每个样本 s (1 <= s <= T-2)：
+              X_s = 所有行业在区间 [months[s-1], months[s]] 的超额收益（即 end-label 为 months[s] 的超额）
+              y_s(i) = 行业 i 在下一区间 [months[s], months[s+1]] 的超额收益
+        - 在月份 s_pred（调仓日 months[s_pred]）上：
+              使用历史 s ∈ [1, s_pred-1] 训练，
+              用 X_{s_pred} 生成对 y_{s_pred}(i) 的预测，
+              并将该预测值记录在因子日期 months[s_pred]
+        - 上层回测中，forward_returns.loc[months[s]] 恰好是区间 [months[s], months[s+1]] 的收益，
+          因此本因子与回测目标完全对齐。
+
     参数:
-        prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
-        window: int, 回溯窗口（交易日），常用20/60
-        rebalance_freq: int, 调仓频率（交易日），常用20
-        benchmark_returns: pd.Series, 基准收益率序列
-        train_periods: int, 训练样本数量（调仓周期数），默认36
-    
+        prices_df: pd.DataFrame
+            行业指数日频价格数据 (index=交易日, columns=行业)，已为后复权价格
+        window: int
+            回溯窗口（交易日），仅用于预热期和输出标签，不参与模型结构
+        rebalance_freq: int
+            调仓频率（交易日），为接口兼容参数，本函数内部按月度运算
+        benchmark_returns: pd.Series or None
+            预留参数（忽略）。函数内部统一按行业等权月度收益构造基准
+        train_periods: int or None
+            训练样本数量上限（以月为单位）。None 表示使用全部可用历史
+
     返回:
-        pd.DataFrame, 预测的未来超额收益，值越大预测表现越好
+        pd.DataFrame
+            日频因子值 (index=交易日, columns=行业)。
+            仅在月末有新值，其余日期向前填充，用于月度调仓回测。
     """
-    # 使用上下文管理器局部抑制警告，避免影响全局设置
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        
-        lookback_returns = prices_df.pct_change(window)
-        forward_returns = prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
-        
-        lookback_benchmark = benchmark_returns.rolling(window).apply(
-            lambda x: (1 + x).prod() - 1, raw=True
-        )
-        forward_benchmark = benchmark_returns.rolling(rebalance_freq).apply(
-            lambda x: (1 + x).prod() - 1, raw=True
-        ).shift(-rebalance_freq)
-        
-        excess_lookback = lookback_returns.sub(lookback_benchmark, axis=0)
-        excess_forward = forward_returns.sub(forward_benchmark, axis=0)
-        
+
+        # === 1. 构造月度价格 & 收益 ===
+        # 使用每个月最后一个交易日作为月末（与 factors_analysis 中的月度调仓逻辑保持一致）
+        trade_dates = prices_df.index
+        monthly_last = trade_dates.to_series().groupby(
+            [trade_dates.year, trade_dates.month]
+        ).apply(lambda x: x.iloc[-1])
+        monthly_last = pd.DatetimeIndex(monthly_last)
+        monthly_close = prices_df.loc[monthly_last]
+
+        # 月度简单收益：本月 / 上月 - 1（end-label：index=本月月末，对应区间[上月末, 本月末]）
+        monthly_ret = monthly_close.pct_change()
+
+        # 等权行业基准的月度收益
+        bench_monthly = monthly_ret.mean(axis=1)
+        # 行业月度超额收益
+        excess_monthly = monthly_ret.sub(bench_monthly, axis=0)
+
         industries = prices_df.columns.tolist()
-        dates = prices_df.index.tolist()
-        predictions = pd.DataFrame(index=prices_df.index, columns=industries, dtype=float)
-        
+        months = monthly_close.index.tolist()
+        T = len(months)
+
+        # 仅在月度索引上暂存预测值（因子日期 = 调仓日 = 区间起点的月末）
+        monthly_pred = pd.DataFrame(index=monthly_close.index,
+                                    columns=industries,
+                                    dtype=float)
+
+        # 至少需要的训练样本数（以月为单位）
         min_train_samples = 10
-        min_start = window + min_train_samples * rebalance_freq
-        prediction_dates = list(range(min_start, len(dates), rebalance_freq))
-        
-        for t_idx in prediction_dates:
-            if t_idx >= len(dates):
-                break
-                
-            current_date = dates[t_idx]
+
+        # 有效样本 s 范围：1 <= s <= T-2
+        #   s 对应调仓日 months[s]，持有区间 [months[s], months[s+1]]
+        #   X_s 使用 end-label=months[s] 的超额收益（上一月区间），
+        #   y_s 使用 end-label=months[s+1] 的超额收益（下一个区间）。
+        for s_pred in range(1 + min_train_samples, T - 1):
+            factor_date = months[s_pred]   # 因子 & 调仓日期
+
+            # 训练样本索引 s ∈ [1, s_pred-1]
+            train_s = list(range(1, s_pred))
+            if train_periods is not None and len(train_s) > train_periods:
+                train_s = train_s[-train_periods:]
+
             X_train_list = []
             y_train_dict = {ind: [] for ind in industries}
-            
-            sample_indices = list(range(window, t_idx - rebalance_freq, rebalance_freq))
-            
-            if train_periods is not None and len(sample_indices) > train_periods:
-                sample_indices = sample_indices[-train_periods:]
-            
-            for sample_idx in sample_indices:
-                X_row = excess_lookback.iloc[sample_idx].values
-                y_idx = sample_idx + rebalance_freq
-                if y_idx >= len(dates):
+
+            # === 2.1 构造训练样本 ===
+            for s in train_s:
+                # X_s: 上一月区间[months[s-1], months[s]]的超额收益（end-label=months[s]）
+                X_row = excess_monthly.loc[months[s]].values
+
+                # y_s: 下一月区间[months[s], months[s+1]]的超额收益（end-label=months[s+1]）
+                y_row = excess_monthly.loc[months[s + 1]]
+
+                # 若整行 X 或 y 全 NaN，则跳过
+                if np.all(np.isnan(X_row)) or y_row.isna().all():
                     continue
-                    
-                if not np.any(np.isnan(X_row)):
-                    X_train_list.append(X_row)
-                    for ind in industries:
-                        y_val = excess_forward.iloc[sample_idx]
-                        if ind in y_val.index:
-                            y_train_dict[ind].append(y_val[ind])
-                        else:
-                            y_train_dict[ind].append(np.nan)
-            
-            if len(X_train_list) < 10:
+
+                X_train_list.append(X_row)
+                for ind in industries:
+                    y_val = y_row.get(ind, np.nan)
+                    y_train_dict[ind].append(y_val)
+
+            if len(X_train_list) < min_train_samples:
                 continue
-                
+
             X_train = np.array(X_train_list)
-            X_current = excess_lookback.iloc[t_idx].values.reshape(1, -1)
-            
+
+            # 当前调仓日 s_pred 的特征：X_{s_pred}
+            X_current = excess_monthly.loc[months[s_pred]].values.reshape(1, -1)
             if np.any(np.isnan(X_current)):
                 continue
-            
+
+            # === 2.2 对每个行业单独做 Lasso 回归 ===
             for ind in industries:
                 y_train = np.array(y_train_dict[ind])
                 valid_mask = ~np.isnan(y_train)
-                if valid_mask.sum() < 10:
+                if valid_mask.sum() < min_train_samples:
                     continue
-                
+
                 X_valid = X_train[valid_mask]
                 y_valid = y_train[valid_mask]
-                
+
                 try:
                     lasso = LassoLarsIC(criterion='aic')
                     lasso.fit(X_valid, y_valid)
                     pred = lasso.predict(X_current)[0]
-                    predictions.loc[current_date, ind] = pred
+                    # 在调仓日 factor_date 记录对下一月超额收益的预测
+                    monthly_pred.loc[factor_date, ind] = pred
                 except Exception:
-                    predictions.loc[current_date, ind] = y_valid.mean()
-        
-        predictions = predictions.ffill()
-        return predictions
+                    # 回归失败时退化为用历史均值预测
+                    monthly_pred.loc[factor_date, ind] = y_valid.mean() if len(y_valid) > 0 else np.nan
+
+        # === 3. 将月度预测扩展回日频索引 ===
+        predictions_daily = pd.DataFrame(index=prices_df.index,
+                                         columns=industries,
+                                         dtype=float)
+
+        # 仅在对应的月末交易日填充值
+        for dt in monthly_pred.index:
+            if dt in predictions_daily.index:
+                predictions_daily.loc[dt] = monthly_pred.loc[dt].values
+
+        # 向前填充，便于统一框架在任意日期取因子值（实际只在月末使用）
+        predictions_daily = predictions_daily.ffill()
+
+        return predictions_daily
 
 
 """
@@ -1181,63 +1249,61 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_r
 """
 def momentum_industry_component(prices_df, window, constituent_df, stock_price_df, industry_code_df, min_stocks=8, std_floor=0.01):
     """
-    行业成分股动量因子 (Industry Component Momentum)
-    
+    行业成分股动量因子 (Industry Component Momentum) - 月频版本
+
     出处：20221201-东方证券-《量化策略研究之六》：行业动量的刻画
-    
+
     理念：
     - 核心思想："一荣俱荣"才是真景气
     - 行业指数的上涨可能仅由一两只高权重龙头股拉动（虚胖），也可能是行业内所有公司业绩改善带来的普涨（实壮）
     - 后者代表了行业整体的基本面逻辑极其顺畅，多头共识极强，因此未来的趋势持续性更好
     - 类似于在横截面上计算"夏普比率"：不仅看涨幅（均值），还要看涨得乱不乱（标准差）
     - 当行业内个股收益率离散度（Dispersion）低时，意味着市场对该行业的利好解读是一致的，反转风险小
-    
-    构造：
-    - 核心公式：S_i = μ_i / σ_i
-    - μ_i：行业内所有成分股在考察期内累计收益率的算术平均值（等权）
-    - σ_i：行业内所有成分股累计收益率的标准差
+
+    构造（研报原文）：
+    - 公式：过去N个月的 行业内个股收益率均值 / 标准差
+    - μ_i：行业内所有成分股在过去N个月的累计收益率的算术平均值（等权）
+    - σ_i：行业内所有成分股累计收益率的截面标准差
     - 分子大 → 行业整体涨得好
     - 分母小 → 行业内部分歧小（大家涨幅差不多）
     - 结果 → 涨得又好又稳的行业得分最高
-    
-    注意事项：
-    - 使用Point-in-Time数据：必须用"当时那个月该行业包含哪些股票"来计算
-    - 等权计算：赋予行业内中小盘股和龙头股相同的权重，反映行业景气度的扩散程度
-    - 分母陷阱：对成分股极少的行业，标准差可能异常小，需设置门槛和下限
-    
+
+    月频调仓：
+    - 每月最后一个交易日计算因子值
+    - window参数为月数（1, 3, 6, 12, 24, 36）
+    - 研报最优参数：window=12（过去12个月）
+
     参数:
         prices_df: pd.DataFrame, 行业指数价格数据 (index=日期, columns=行业)
-        window: int, 回溯窗口（交易日）
-        constituent_df: pd.DataFrame, 行业成分股数据（通过data_loader.load_constituent_df()加载）
-        stock_price_df: pd.DataFrame, 个股复权收盘价数据（通过data_loader.load_stock_price_df()加载）
-        industry_code_df: pd.DataFrame, 行业代码映射数据（通过data_loader.load_industry_code_df()加载）
+        window: int, 回溯窗口（月数，如12表示过去12个月）
+        constituent_df: pd.DataFrame, 行业成分股数据
+        stock_price_df: pd.DataFrame, 个股复权收盘价数据
+        industry_code_df: pd.DataFrame, 行业代码映射数据
         min_stocks: int, 最少成分股数量门槛，默认8
         std_floor: float, 标准差下限，防止分母过小，默认0.01
-    
+
     返回:
-        pd.DataFrame, 行业成分股动量因子值，值越大表示行业"一致性上涨"越强
+        pd.DataFrame, 行业成分股动量因子值（月频，仅月末有值）
     """
     from data_loader import get_industry_name_to_code_map
-    
+
     # ========== 第一阶段：构建行业名称到行业代码的映射 ==========
-    
     industries = prices_df.columns.tolist()
-    
-    # 获取行业名称到代码的映射
     sw_industry_codes = get_industry_name_to_code_map(industry_code_df)
-    
-    # 构建行业名称到代码的映射
+
     industry_name_to_code = {}
     for ind_name in industries:
         clean_name = ind_name.replace('（申万）', '').replace('(申万)', '')
         if clean_name in sw_industry_codes:
             industry_name_to_code[ind_name] = sw_industry_codes[clean_name]
-    
-    # ========== 第三阶段：定义辅助函数 ==========
 
-    # 预处理：构建日期到成分股的缓存
-    # 按行业和日期预先分组，避免每次查询都遍历整个DataFrame
-    constituent_dates = sorted(constituent_df['date'].unique())
+    # ========== 第二阶段：获取月末日期列表 ==========
+    # 按月分组，取每月最后一个交易日
+    prices_df_copy = prices_df.copy()
+    prices_df_copy['year_month'] = prices_df_copy.index.to_period('M')
+    month_end_dates = prices_df_copy.groupby('year_month').apply(lambda x: x.index[-1]).tolist()
+
+    # ========== 第三阶段：构建成分股缓存 ==========
     constituent_cache = {}
     for ind_code in industry_name_to_code.values():
         ind_data = constituent_df[constituent_df['index_code'] == ind_code]
@@ -1246,109 +1312,78 @@ def momentum_industry_component(prices_df, window, constituent_df, stock_price_d
             for date in ind_data['date'].unique()
         }
 
-    def get_constituent_stocks_pit(industry_code, date, constituent_data):
-        """
-        获取指定行业在指定日期的成分股列表（Point-in-Time）
-        使用该日期之前最近的成分股数据
-        """
+    def get_constituent_stocks_pit(industry_code, date):
+        """获取指定行业在指定日期的成分股列表（Point-in-Time）"""
         if industry_code not in constituent_cache:
             return []
-
         ind_cache = constituent_cache[industry_code]
-        # 找到该日期之前最近的成分股数据日期
         valid_dates = [d for d in ind_cache.keys() if d <= date]
         if len(valid_dates) == 0:
             return []
-
         latest_date = max(valid_dates)
         return ind_cache.get(latest_date, [])
-    
-    def calculate_stock_returns(stock_codes, date, price_df, lookback_window):
+
+    def calculate_stock_returns_monthly(stock_codes, end_date, start_date, price_df):
         """
-        计算指定股票在指定日期往前lookback_window天的累计收益率
-        剔除数据不完整的股票（新股、长期停牌）
+        计算指定股票从start_date到end_date的累计收益率
         """
-        if date not in price_df.index:
+        if end_date not in price_df.index or start_date not in price_df.index:
             return pd.Series(dtype=float)
-        
-        date_idx = price_df.index.get_loc(date)
-        if date_idx < lookback_window:
-            return pd.Series(dtype=float)
-        
-        # 获取窗口期的起始和结束价格
-        start_idx = date_idx - lookback_window
-        start_date = price_df.index[start_idx]
-        
-        # 筛选有效的股票代码
+
         valid_codes = [code for code in stock_codes if code in price_df.columns]
         if len(valid_codes) == 0:
             return pd.Series(dtype=float)
-      
-        # 获取起始和结束价格
+
         start_prices = price_df.loc[start_date, valid_codes]
-        end_prices = price_df.loc[date, valid_codes]
-        
+        end_prices = price_df.loc[end_date, valid_codes]
+
         # 计算累计收益率
         returns = (end_prices / start_prices) - 1
-        
-        # 剔除无效数据（NaN、Inf）
         returns = returns.replace([np.inf, -np.inf], np.nan)
         returns = returns.dropna()
-        
+
         return returns
-    
-    # ========== 第四阶段：计算因子值 ==========
-    
-    # 初始化结果DataFrame
+
+    # ========== 第四阶段：计算因子值（仅月末） ==========
     factor_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
-    
-    all_dates = prices_df.index.tolist()
-    total_dates = len(all_dates)
 
-    print("正在计算行业成分股动量因子...")
-    progress = ProgressBar(total=total_dates, desc='行业成分股动量')
+    print(f"正在计算行业成分股动量因子（月频，回溯{window}个月）...")
+    progress = ProgressBar(total=len(month_end_dates), desc='行业成分股动量')
 
-    for i, date in enumerate(all_dates):
+    for i, end_date in enumerate(month_end_dates):
+        progress.update(i + 1)
+
+        # 找到window个月前的月末日期
         if i < window:
             continue
+        start_date = month_end_dates[i - window]
 
-        progress.update(i + 1)
-        
         for ind_name in industries:
             if ind_name not in industry_name_to_code:
                 continue
-            
+
             ind_code = industry_name_to_code[ind_name]
-            
-            # 获取当时的成分股（Point-in-Time）
-            stocks = get_constituent_stocks_pit(ind_code, date, constituent_df)
-            
-            # 检查成分股数量门槛
+            stocks = get_constituent_stocks_pit(ind_code, end_date)
+
             if len(stocks) < min_stocks:
                 continue
-            
+
             # 计算成分股的累计收益率
-            stock_returns = calculate_stock_returns(stocks, date, stock_price_df, window)
-            
-            # 再次检查有效股票数量
+            stock_returns = calculate_stock_returns_monthly(stocks, end_date, start_date, stock_price_df)
+
             if len(stock_returns) < min_stocks:
                 continue
-            
+
             # 计算均值和标准差
             mu = stock_returns.mean()
             sigma = stock_returns.std()
-            
-            # 应用标准差下限
             sigma = max(sigma, std_floor)
-            
-            # 计算因子值：μ / σ
-            factor_value = mu / sigma
-            
-            factor_df.loc[date, ind_name] = factor_value
-    
-    # 处理无穷大和NaN
-    factor_df = factor_df.replace([np.inf, -np.inf], np.nan)
 
+            # 因子值：μ / σ
+            factor_value = mu / sigma
+            factor_df.loc[end_date, ind_name] = factor_value
+
+    factor_df = factor_df.replace([np.inf, -np.inf], np.nan)
     progress.finish()
 
     return factor_df
