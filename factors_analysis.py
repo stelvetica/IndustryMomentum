@@ -83,21 +83,29 @@ FACTOR_CONFIG = {
     },
 
     # ===== 平稳动量因子 =====
+    'momentum_volume_return_corr': {
+        'func': factor_.momentum_volume_return_corr,
+        'base_warmup': 0,
+        'window_multiplier': 1,
+        'lookback_windows': [10, 20, 30, 60, 120, 180, 240],  # 研报最优10日，20日也有一定效果
+        'requires_constituent': False,
+        'description': '平稳动量1-5-量益相关性动量因子（长江风险篇）'
+    },
     'momentum_turnover_adj': {
         'func': factor_.momentum_turnover_adj,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
         'requires_constituent': False,
-        'description': '平稳动量1-4-换手率调整动量因子（量价背离）'
+        'description': '平稳动量2-5-换手率调整动量因子（量价背离）'
     },
     'momentum_price_volume_icir': {
         'func': factor_.momentum_price_volume_icir,
         'base_warmup': 240,
         'window_multiplier': 0,
-        'lookback_windows': [20],
+        'lookback_windows': [240], #固定使用10-240日
         'requires_constituent': False,
-        'description': '平稳动量2-4-量价清洗ICIR加权动量因子'
+        'description': '平稳动量3-5-量价清洗ICIR加权动量因子'
     },
     'momentum_rebound_with_crowding_filter': {
         'func': factor_.momentum_rebound_with_crowding_filter,
@@ -105,15 +113,15 @@ FACTOR_CONFIG = {
         'window_multiplier': 1,
         'lookback_windows': None,
         'requires_constituent': False,
-        'description': '平稳动量3-4-反弹动量因子（综合动量+拥挤度过滤）'
+        'description': '平稳动量4-5-反弹动量因子（综合动量+拥挤度过滤）'
     },
     'momentum_amplitude_cut': {
         'func': factor_.momentum_amplitude_cut,
         'base_warmup': 0,
         'window_multiplier': 1,
-        'lookback_windows': None,
+        'lookback_windows': [120],  # 研报最优参数：N=160天（约8个月）
         'requires_constituent': False,
-        'description': '平稳动量4-4-振幅切割动量因子（只算稳健区域）'
+        'description': '平稳动量5-5-振幅切割稳健动量因子（开源证券A因子）'
     },
 
     # ===== 特质收益动量因子 =====
@@ -233,12 +241,12 @@ def get_output_path(factor_name=None, duration_str=None, end_date=None):
     return os.path.join(OUTPUT_DIR, filename)
 
 
-def calculate_backtest_dates(data_start, data_end, end_date=None, backtest_years=10):
+def calculate_backtest_dates(data_start, data_end, end_date=None, backtest_years=10, freq='M'):
     """
     计算回测的起始和结束日期
 
     逻辑：
-    1. 先确定最晚持仓日（最新完整月末）
+    1. 先确定最晚持仓日（最新完整周期末）
     2. 往前推backtest_years年的12月底作为最早持仓日
     3. 如果数据不够，就从数据起始日开始
 
@@ -246,15 +254,17 @@ def calculate_backtest_dates(data_start, data_end, end_date=None, backtest_years
     data_start: pd.Timestamp, 数据交集的起始日期
     data_end: pd.Timestamp, 数据交集的结束日期
     end_date: str 或 None, 用户指定的截止日期，None表示使用数据最新日期
-    backtest_years: int, 回测年限，默认10年
+    backtest_years: int, 回测年限，默认12年
+    freq: str, 调仓频率，'M'=月频(默认), 'W'=周频
 
     返回:
     tuple: (first_holding_date, last_holding_date, data_start_needed)
         - first_holding_date: str, 最早持仓日（如 '2015-12-31'）
-        - last_holding_date: pd.Timestamp, 最晚持仓日（最新完整月末）
+        - last_holding_date: pd.Timestamp, 最晚持仓日（最新完整周期末）
         - data_start_needed: str, 数据需要的起始日期（考虑预热期后会自动调整）
     """
     import pandas as pd
+    import calendar
 
     # 确定截止日期
     if end_date is None:
@@ -265,38 +275,68 @@ def calculate_backtest_dates(data_start, data_end, end_date=None, backtest_years
         if end_dt > data_end:
             end_dt = data_end
 
-    # 最晚持仓日：截止日期所在月的上一个完整月末
-    # 例如：2025-12-19 -> 2025-11-30
-    last_holding_year = end_dt.year
-    last_holding_month = end_dt.month - 1
-    if last_holding_month == 0:
-        last_holding_month = 12
-        last_holding_year -= 1
+    if freq == 'W':
+        # 周频：最晚持仓日为截止日期之前的最后一个周五
+        days_since_friday = (end_dt.weekday() - 4) % 7
+        if days_since_friday == 0:
+            # 如果正好是周五，往前推一周（确保是完整的一周）
+            days_since_friday = 7
+        last_holding_date = end_dt - pd.Timedelta(days=days_since_friday)
 
-    # 获取该月的最后一天
-    import calendar
-    _, last_day = calendar.monthrange(last_holding_year, last_holding_month)
-    last_holding_date = pd.Timestamp(year=last_holding_year, month=last_holding_month, day=last_day)
+        # 最早持仓日：基于最晚持仓日的年份往前推backtest_years年
+        # 找到该年12月最后一个周五
+        # 注意：如果最晚持仓日在1月，应该基于上一年计算
+        base_year = last_holding_date.year
+        if last_holding_date.month == 1:
+            base_year -= 1  # 如果最晚持仓日在1月，基准年份应该是上一年
 
-    # 最早持仓日：往前推backtest_years年的12月31日
-    first_holding_year = last_holding_date.year - backtest_years
-    first_holding_date = pd.Timestamp(year=first_holding_year, month=12, day=31)
+        first_holding_year = base_year - backtest_years
+        # 找到该年12月31日
+        dec_31 = pd.Timestamp(year=first_holding_year, month=12, day=31)
+        # 找到12月31日之前（含）的最后一个周五
+        days_to_friday = (dec_31.weekday() - 4) % 7
+        first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+
+    else:
+        # 月频：最晚持仓日为截止日期所在月的上一个完整月末
+        # 例如：2025-12-19 -> 2025-11-30
+        last_holding_year = end_dt.year
+        last_holding_month = end_dt.month - 1
+        if last_holding_month == 0:
+            last_holding_month = 12
+            last_holding_year -= 1
+
+        # 获取该月的最后一天
+        _, last_day = calendar.monthrange(last_holding_year, last_holding_month)
+        last_holding_date = pd.Timestamp(year=last_holding_year, month=last_holding_month, day=last_day)
+
+        # 最早持仓日：往前推backtest_years年的12月31日
+        first_holding_year = last_holding_date.year - backtest_years
+        first_holding_date = pd.Timestamp(year=first_holding_year, month=12, day=31)
 
     # 检查数据是否足够
     # 数据起始日期需要比最早持仓日更早（因为需要预热期）
     # 这里先返回最早持仓日，实际数据起始会在加载时根据预热期调整
     if first_holding_date < data_start:
         # 数据不够，从数据起始日开始
-        # 找到数据起始后的第一个12月31日作为最早持仓日
+        # 找到数据起始后的第一个有效持仓日
         first_year = data_start.year
         if data_start.month > 1 or (data_start.month == 1 and data_start.day > 1):
-            # 如果数据起始不是1月1日，需要等到下一年的12月31日
+            # 如果数据起始不是1月1日，需要等到下一年
             first_year += 1
-        first_holding_date = pd.Timestamp(year=first_year, month=12, day=31)
+
+        if freq == 'W':
+            # 周频：找到该年12月最后一个周五
+            dec_31 = pd.Timestamp(year=first_year, month=12, day=31)
+            days_to_friday = (dec_31.weekday() - 4) % 7
+            first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+        else:
+            # 月频：12月31日
+            first_holding_date = pd.Timestamp(year=first_year, month=12, day=31)
 
         # 如果调整后的最早持仓日超过了最晚持仓日，说明数据范围太小
         if first_holding_date >= last_holding_date:
-            # 使用数据起始后的第一个月末作为最早持仓日
+            # 使用数据起始后的第一个周期末作为最早持仓日
             first_holding_date = data_start
 
     return (first_holding_date.strftime('%Y-%m-%d'),
@@ -2827,6 +2867,53 @@ def format_excel_report(file_path: str):
     wb.save(file_path)
 
 
+# ============================================================
+# 泡沫因子调用接口
+# ============================================================
+
+def run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=None):
+    """
+    运行泡沫因子分析（周频调仓）
+
+    调用 bubble/positive_bubble_factor_core.py 中的主函数
+
+    参数:
+        backtest_years: int, 回测年限，默认10年
+        end_date: str, 截止日期，默认使用数据最新日期
+
+    返回:
+        dict: 回测结果
+    """
+    try:
+        # 尝试导入泡沫因子模块
+        import sys
+        bubble_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bubble')
+        if bubble_dir not in sys.path:
+            sys.path.insert(0, bubble_dir)
+
+        from positive_bubble_factor_core import main as bubble_main
+
+        print("\n" + "=" * 60)
+        print("运行泡沫因子分析（周频调仓）")
+        print("=" * 60)
+
+        # 调用泡沫因子主函数
+        result = bubble_main(
+            backtest_years=backtest_years,
+            end_date=end_date
+        )
+
+        return result
+
+    except ImportError as e:
+        print(f"\n错误: 无法导入泡沫因子模块 - {e}")
+        print("请确保 bubble/positive_bubble_factor_core.py 文件存在")
+        return None
+    except Exception as e:
+        print(f"\n错误: 运行泡沫因子时出错 - {e}")
+        return None
+
+
 if __name__ == "__main__":
     import time
     start_time = time.time()
@@ -2891,3 +2978,9 @@ if __name__ == "__main__":
 
     print(f"\n分析完成！报告已保存至: {output_file}")
     print(f"总耗时: {hours}小时{minutes}分钟" if hours > 0 else f"总耗时: {minutes}分钟")
+
+    # ========== 运行泡沫因子分析（周频调仓）==========
+    print("\n" + "=" * 60)
+    print("开始运行泡沫因子分析（周频调仓）...")
+    print("=" * 60)
+    run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=end_date)

@@ -92,6 +92,9 @@ def print_progress(current: int, total: int, prefix: str = "",
 # 默认数据文件路径
 DEFAULT_CACHE_FILE = "data/sw_industry_data.pkl"
 
+# 默认输出目录 (与 factors_analysis.py 一致)
+OUTPUT_DIR = "factor分析"
+
 # 导入 factors_analysis 中的日期计算函数
 HAS_FACTORS_ANALYSIS = False
 try:
@@ -110,13 +113,16 @@ except ImportError:
         pass
 
 
-def _calculate_backtest_dates_simple(data_start, data_end, end_date=None, backtest_years=10):
+def _calculate_backtest_dates_simple(data_start, data_end, end_date=None, backtest_years=10, freq='W'):
     """
     简化版回测日期计算 (与 factors_analysis.py 逻辑一致)
 
     逻辑：
-    1. 最晚持仓日 = 截止日期所在月的上一个完整月末
-    2. 最早持仓日 = 往前推 backtest_years 年的12月31日
+    1. 最晚持仓日 = 截止日期所在周期的上一个完整周期末
+    2. 最早持仓日 = 往前推 backtest_years 年的12月最后一个周五(周频)或12月31日(月频)
+
+    参数:
+        freq: str, 调仓频率，'W'=周频(默认), 'M'=月频
     """
     import calendar
 
@@ -128,26 +134,49 @@ def _calculate_backtest_dates_simple(data_start, data_end, end_date=None, backte
         if end_dt > data_end:
             end_dt = data_end
 
-    # 最晚持仓日：截止日期所在月的上一个完整月末
-    last_holding_year = end_dt.year
-    last_holding_month = end_dt.month - 1
-    if last_holding_month == 0:
-        last_holding_month = 12
-        last_holding_year -= 1
+    if freq == 'W':
+        # 周频：最晚持仓日为截止日期之前的最后一个周五
+        days_since_friday = (end_dt.weekday() - 4) % 7
+        if days_since_friday == 0:
+            days_since_friday = 7  # 如果正好是周五，往前推一周
+        last_holding_date = end_dt - pd.Timedelta(days=days_since_friday)
 
-    _, last_day = calendar.monthrange(last_holding_year, last_holding_month)
-    last_holding_date = pd.Timestamp(year=last_holding_year, month=last_holding_month, day=last_day)
+        # 最早持仓日：基于最晚持仓日的年份往前推backtest_years年
+        base_year = last_holding_date.year
+        if last_holding_date.month == 1:
+            base_year -= 1  # 如果最晚持仓日在1月，基准年份应该是上一年
 
-    # 最早持仓日：往前推 backtest_years 年的12月31日
-    first_holding_year = last_holding_date.year - backtest_years
-    first_holding_date = pd.Timestamp(year=first_holding_year, month=12, day=31)
+        first_holding_year = base_year - backtest_years
+        dec_31 = pd.Timestamp(year=first_holding_year, month=12, day=31)
+        days_to_friday = (dec_31.weekday() - 4) % 7
+        first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+    else:
+        # 月频：最晚持仓日为截止日期所在月的上一个完整月末
+        last_holding_year = end_dt.year
+        last_holding_month = end_dt.month - 1
+        if last_holding_month == 0:
+            last_holding_month = 12
+            last_holding_year -= 1
+
+        _, last_day = calendar.monthrange(last_holding_year, last_holding_month)
+        last_holding_date = pd.Timestamp(year=last_holding_year, month=last_holding_month, day=last_day)
+
+        # 最早持仓日：往前推 backtest_years 年的12月31日
+        first_holding_year = last_holding_date.year - backtest_years
+        first_holding_date = pd.Timestamp(year=first_holding_year, month=12, day=31)
 
     # 检查数据是否足够
     if first_holding_date < data_start:
         first_year = data_start.year
         if data_start.month > 1 or (data_start.month == 1 and data_start.day > 1):
             first_year += 1
-        first_holding_date = pd.Timestamp(year=first_year, month=12, day=31)
+
+        if freq == 'W':
+            dec_31 = pd.Timestamp(year=first_year, month=12, day=31)
+            days_to_friday = (dec_31.weekday() - 4) % 7
+            first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+        else:
+            first_holding_date = pd.Timestamp(year=first_year, month=12, day=31)
 
     return first_holding_date, last_holding_date, str(first_holding_date.date())
 
@@ -206,12 +235,12 @@ def load_data(
         print(f"原始数据: {n_industries} 个行业")
         print(f"原始日期范围: {prices_df.index[0].date()} 至 {prices_df.index[-1].date()}")
 
-    # 使用 factors_analysis 的日期计算逻辑
+    # 使用 factors_analysis 的日期计算逻辑 (周频)
     if HAS_FACTORS_ANALYSIS:
         # calculate_backtest_dates 返回 (first_holding_date, last_holding_date, data_start_needed)
         first_holding_date, last_holding_date, _ = calculate_backtest_dates(
             prices_df.index[0], prices_df.index[-1],
-            end_date=end_date, backtest_years=backtest_years
+            end_date=end_date, backtest_years=backtest_years, freq='W'
         )
 
         # 转换为 Timestamp
@@ -229,10 +258,10 @@ def load_data(
         data_end = last_holding_ts
 
     else:
-        # 使用简化版本的日期计算 (与 factors_analysis.py 逻辑一致)
+        # 使用简化版本的日期计算 (与 factors_analysis.py 逻辑一致, 周频)
         first_holding_date, last_holding_date, _ = _calculate_backtest_dates_simple(
             prices_df.index[0], prices_df.index[-1],
-            end_date=end_date, backtest_years=backtest_years
+            end_date=end_date, backtest_years=backtest_years, freq='W'
         )
 
         first_holding_ts = first_holding_date
@@ -1471,15 +1500,19 @@ def export_to_excel(
 
     参数:
         backtest_result: dict, 回测结果
-        output_file: str, 输出文件路径，默认为 "positive_bubble_backtest_YYYYMMDD_HHMMSS.xlsx"
+        output_file: str, 输出文件路径，默认为 "factor分析/positive_bubble_backtest_YYYYMMDD_HHMMSS.xlsx"
         verbose: bool, 是否打印导出信息
 
     返回:
         str: 导出文件路径
     """
     if output_file is None:
+        # 确保输出目录存在
+        if not os.path.exists(OUTPUT_DIR):
+            os.makedirs(OUTPUT_DIR)
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f"positive_bubble_backtest_{timestamp}.xlsx"
+        output_file = os.path.join(OUTPUT_DIR, f"positive_bubble_backtest_{timestamp}.xlsx")
 
     if verbose:
         print(f"\n正在导出回测结果到: {output_file}")

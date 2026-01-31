@@ -116,5 +116,10 @@ if __name__ == "__main__":
     #run_analysis('momentum_cross_industry_lasso', '2022-11-30')
     #run_analysis('momentum_cross_industry_lasso', None)
     #run_analysis('momentum_industry_component', '2022-11-02')  # 研报截止日期
-    run_analysis('momentum_industry_component', None)  # 最新数据
+    #run_analysis('momentum_industry_component', None)  # 最新数据
+    #run_analysis('momentum_price_volume_icir', '2022-12-31')
+    #run_analysis('momentum_price_volume_icir', None)
+    #run_analysis('momentum_amplitude_cut', '2020-06-30')
+    #run_analysis('momentum_amplitude_cut', None)
+    run_analysis('momentum_volume_return_corr', None)
     

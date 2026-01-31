@@ -266,6 +266,45 @@ def momentum_rank_zscore(prices_df, window):
 """
 平稳动量因子
 """
+def momentum_volume_return_corr(prices_df, amount_df, window):
+    """
+    量益相关性动量因子（成交额-收益率相关性）
+    
+    出处：20220914-长江证券-行业轮动系列(六)：风险篇
+    
+    理念：量益相关性本质为成交量调整的收益率，属于动量因子。
+          该值越大，在行业成交活跃时收益能力越强，风险溢价越高。
+          正相关说明增量资金持续推升价格，动量可持续。
+    构造：corr(行业成交额, 行业收益率)，计算窗口内的Pearson相关系数
+    
+    最优参数（研报表14）：
+        - window=10日: IC=4.55%, ICIR=17.79%（最优）
+        - 可配合分位数优化: 量益相关性_10_分位_720 IC=5.32%, ICIR=21.93%
+    
+    参数:
+        prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
+        amount_df: pd.DataFrame, 成交额数据 (index=日期, columns=行业)
+        window: int, 回溯窗口（交易日），研报最优10日
+    
+    返回:
+        pd.DataFrame, 量益相关性因子值，值越大风险溢价越高（正向因子）
+    """
+    # 计算日收益率
+    daily_returns = prices_df.pct_change()
+    
+    # 计算滚动窗口内成交额与收益率的Pearson相关系数
+    factor_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
+    
+    for col in prices_df.columns:
+        ret_series = daily_returns[col]
+        amt_series = amount_df[col]
+        
+        # 滚动计算相关性
+        factor_df[col] = ret_series.rolling(window=window).corr(amt_series)
+    
+    return factor_df
+
+
 def momentum_turnover_adj(prices_df, turnover_df, window):
     """
     换手率调整动量因子（量价背离动量）
@@ -295,32 +334,32 @@ def momentum_turnover_adj(prices_df, turnover_df, window):
 
 
 def momentum_price_volume_icir(prices_df, amount_df, window=20,
-                                rebalance_freq=20, lookback_num_for_icir=None):
+                                rebalance_freq=20, lookback_num_for_icir=12):
     """
     量价清洗ICIR加权动量因子
-    
+
     出处：20220406-长江证券-行业轮动系列(五)：动量篇
-    
+
     理念：从量（成交额）和价（波动率）两个维度"清洗"动量，剔除情绪噪音。
           通过ICIR动态加权将短期和长期动量合成为复合因子。
     构造：
-        - 量维度：剔除成交额最高10%交易日，累加剩余日收益率
-        - 价维度：路径平滑度 = 区间总涨幅 / Σ|日收益率|
+        - 量维度：剔除成交额最高10%交易日，累加剩余日对数收益率
+        - 价维度：路径平滑度 = 区间总涨幅(对数) / Σ|日对数收益率|
         - 合成：M = z(Factor_Amt) + z(Factor_Pric)
-        - 加权：IR = Mean(IC)/Std(IC)，按IR归一化加权短期和长期因子
-    
+        - 加权：IR = Mean(IC)/Std(IC)，按IR归一化加权短期(10日)和长期(240日)因子
+
     参数:
         prices_df: pd.DataFrame, 价格数据 (index=日期, columns=行业)
         amount_df: pd.DataFrame, 成交额数据 (index=日期, columns=行业)
-        window: int, 该参数不使用，保留仅为兼容性。因子固定使用短期20天、长期240天
+        window: int, 该参数不使用，保留仅为兼容性。因子固定使用短期10天、长期240天
         rebalance_freq: int, 调仓频率，默认20
-        lookback_num_for_icir: int or None, 计算ICIR的回溯IC数量
-    
+        lookback_num_for_icir: int or None, 计算ICIR的回溯IC数量，默认12（滚动12个月）
+
     返回:
         pd.DataFrame, 量价清洗ICIR加权动量因子值，值越大动量越强
     """
-    # 固定窗口设置（原文设计：短期20天，长期240天，两者无特定比例关系）
-    short_window = 20
+    # 固定窗口设置（长江证券研报：短期10天，长期240天）
+    short_window = 10
     long_window = 240
     
     def calc_log_returns(prices):
@@ -687,119 +726,101 @@ def momentum_rebound_with_crowding_filter(prices_df, amount_df, window=240,
     return adjusted_momentum
 
 
-def momentum_amplitude_cut(high_df, low_df, prices_df, window=60,
-                           selection_ratio=0.70, vol_window=20,
-                           vol_smooth_window=None):
+def momentum_amplitude_cut(high_df, low_df, prices_df, window=120,
+                           selection_ratio=0.50):
     """
-    波动率调整后的振幅切割动量因子（Vol-Adjusted ID Momentum）
-    
+    振幅切割稳健动量因子（Amplitude-Cut Momentum / A因子）
+
     出处：20200721-开源证券-开源量化评论（3）：A股市场中如何构造动量因子？
-    
-    理念：只统计"风平浪静"日子的涨幅（低振幅日代表真实趋势），
-          并用近期波动率作为风险惩罚项，偏好"低调稳健上涨"的行业。
-    构造：
-        - 分子：按振幅排序，取前selection_ratio比例低振幅日的对数收益率之和
-        - 分母：近期vol_window天的波动率
-        - 因子 = Mom_raw / Vol_recent
-    
+
+    研报核心逻辑：
+    - A股市场呈现显著反转效应，传统动量因子失效
+    - 反转效应主要来自高振幅（交易活跃）的日子
+    - 低振幅日代表"风平浪静"的真实趋势，呈现动量效应
+    - 高振幅日代表"过度反应"的噪音，呈现反转效应
+
+    构造步骤（表1）：
+    1. 对选定股票，回溯取其最近N个交易日的数据
+    2. 计算股票每日的振幅（最高价/最低价-1）
+    3. 选择振幅较低的λ比例交易日，涨跌幅加总，记为A因子
+
+    研报最优参数：
+    - N = 160个交易日（约8个月）
+    - λ = 70%（保留振幅最低的70%交易日）
+    - IC均值 = 0.036，ICIR = 1.31
+
     参数:
         high_df: pd.DataFrame, 最高价数据（后复权）
         low_df: pd.DataFrame, 最低价数据（后复权）
         prices_df: pd.DataFrame, 收盘价数据（后复权）
-        window: int, 动量窗口，默认60
-        selection_ratio: float, 低振幅日保留比例，默认0.70
-        vol_window: int, 波动率窗口，默认20
-        vol_smooth_window: int or None, 波动率平滑窗口，默认None
-    
+        window: int, 回溯窗口（交易日），研报最优160
+        selection_ratio: float, 低振幅日保留比例λ，研报最优0.70
+
     返回:
-        pd.DataFrame, 波动率调整后的振幅切割动量因子值，值越大动量越稳健
+        pd.DataFrame, 振幅切割动量因子值（A因子），值越大动量越强
     """
-    
+
     # ========== 步骤1：基础特征计算 ==========
-    
-    # 对数收益率：解决涨跌幅不对称问题
-    # r_t = ln(Close_t) - ln(Close_{t-1})
-    log_returns = np.log(prices_df / prices_df.shift(1))
-    
+
+    # 日收益率（简单收益率，与研报一致）
+    # r_t = Close_t / Close_{t-1} - 1
+    daily_returns = prices_df.pct_change()
+
     # 日内振幅：Amp_t = High_t / Low_t - 1
+    # 研报原文步骤2
     amplitude = high_df / low_df - 1
-    
-    # 计算需要保留的天数（用于振幅切割）
+
+    # 计算需要保留的天数（振幅最低的λ比例）
+    # 研报步骤3：选择振幅较低的λ比例交易日
     keep_n = int(window * selection_ratio)
-    
-    # ========== 步骤2：预计算滚动波动率 ==========
-    # 利用pandas rolling加速计算
-    # 这里计算的是每个时点往前看 vol_window 天的波动率
-    rolling_vol = log_returns.rolling(window=vol_window).std()
-    
-    # 可选：对波动率进行平滑处理
-    if vol_smooth_window is not None and vol_smooth_window > 1:
-        rolling_vol = rolling_vol.rolling(window=vol_smooth_window).mean()
-    
-    # ========== 步骤3：确定计算起始点 ==========
-    # 需要同时满足动量窗口和波动率窗口的数据要求
-    start_idx = max(window, vol_window)
-    
-    # ========== 步骤4：初始化结果DataFrame ==========
+
+    # ========== 步骤2：初始化结果DataFrame ==========
     factor_df = pd.DataFrame(index=prices_df.index, columns=prices_df.columns, dtype=float)
-    
-    # ========== 步骤5：滚动窗口计算因子值 ==========
-    
+
+    # ========== 步骤3：滚动窗口计算因子值 ==========
+
     # 对每个行业分别计算
     for col in prices_df.columns:
-        log_ret_series = log_returns[col]
+        ret_series = daily_returns[col]
         amp_series = amplitude[col]
-        vol_series = rolling_vol[col]
-        
+
         factor_values = [np.nan] * len(prices_df)
-        
-        # 从 start_idx 开始遍历
-        for i in range(start_idx, len(prices_df)):
-            
-            # ========== A. 分子计算 (ID Momentum) ==========
-            # 取 T-window 到 T-1 的切片（不包含当天T，防止未来函数）
-            window_log_ret = log_ret_series.iloc[i-window:i]
+
+        # 从 window 开始遍历（需要完整的回溯窗口）
+        for i in range(window, len(prices_df)):
+
+            # 取过去N个交易日的数据（T-N到T-1，不包含当天T）
+            # 研报步骤1：回溯取其最近N个交易日的数据
+            window_ret = ret_series.iloc[i-window:i]
             window_amp = amp_series.iloc[i-window:i]
-            
+
             # 构建临时DataFrame用于排序
             window_data = pd.DataFrame({
-                'log_ret': window_log_ret.values,
+                'ret': window_ret.values,
                 'amp': window_amp.values
             })
-            
+
             # 剔除NaN值
             window_data = window_data.dropna()
-            
+
             if len(window_data) < keep_n:
                 # 数据不足，跳过
                 continue
-            
-            # 核心逻辑：
+
+            # 核心逻辑（研报步骤3）：
             # 1. 按振幅从小到大排序
-            # 2. 取前 selection_ratio 比例（低振幅日）
-            # 3. 对数收益率相加，得出这些日子的净趋势
+            # 2. 取前λ比例（低振幅日）
+            # 3. 涨跌幅加总
             selected_subset = window_data.nsmallest(keep_n, columns='amp')
-            
-            # 原始动量：低振幅日的对数收益率之和
-            raw_mom = selected_subset['log_ret'].sum()
-            
-            # ========== B. 分母计算 (Volatility Penalty) ==========
-            # 获取 T 时刻对应的 T-1 时的滚动波动率
-            # i-1 对应的是昨天的数据行，但rolling已经是往前看的，所以直接用i-1位置的值
-            # 注意：rolling_vol.iloc[i-1] 代表的是截止到 i-1 时刻往前看 vol_window 天的波动率
-            current_vol = vol_series.iloc[i-1]
-            
-            # ========== C. 合成 (防除零处理) ==========
-            if pd.isna(current_vol) or current_vol == 0:
-                # 极低波动或数据缺失时的保护，赋予0
-                final_score = 0.0
-            else:
-                final_score = raw_mom / current_vol
-            
-            factor_values[i] = final_score
-        
+
+            # A因子：低振幅日的涨跌幅之和
+            # 研报原文："选择振幅较低的λ比例交易日，涨跌幅加总，记为A因子"
+            factor_value = selected_subset['ret'].sum()
+
+            factor_values[i] = factor_value
+
         factor_df[col] = factor_values
-    
+
     return factor_df
 
 
