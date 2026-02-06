@@ -18,6 +18,10 @@ from datetime import datetime
 import data_loader
 import factor_
 import os
+# 导入openpyxl图表模块
+from openpyxl.chart import LineChart, Reference
+from openpyxl.chart.series import SeriesLabel
+from openpyxl.chart.shapes import GraphicalProperties
 
 
 # 输出文件夹
@@ -89,7 +93,7 @@ FACTOR_CONFIG = {
         'window_multiplier': 1,
         'lookback_windows': [10, 20, 30, 60, 120, 180, 240],  # 研报最优10日，20日也有一定效果
         'requires_constituent': False,
-        'description': '平稳动量1-5-量益相关性动量因子（长江风险篇）'
+        'description': '平稳动量1-5-量益相关性动量因子（量价同向）'
     },
     'momentum_turnover_adj': {
         'func': factor_.momentum_turnover_adj,
@@ -97,15 +101,7 @@ FACTOR_CONFIG = {
         'window_multiplier': 1,
         'lookback_windows': None,
         'requires_constituent': False,
-        'description': '平稳动量2-5-换手率调整动量因子（量价背离）'
-    },
-    'momentum_price_volume_icir': {
-        'func': factor_.momentum_price_volume_icir,
-        'base_warmup': 240,
-        'window_multiplier': 0,
-        'lookback_windows': [240], #固定使用10-240日
-        'requires_constituent': False,
-        'description': '平稳动量3-5-量价清洗ICIR加权动量因子'
+        'description': '平稳动量2-5-换手率惩罚动量因子（量价背离）'
     },
     'momentum_rebound_with_crowding_filter': {
         'func': factor_.momentum_rebound_with_crowding_filter,
@@ -113,15 +109,23 @@ FACTOR_CONFIG = {
         'window_multiplier': 1,
         'lookback_windows': None,
         'requires_constituent': False,
-        'description': '平稳动量4-5-反弹动量因子（综合动量+拥挤度过滤）'
+        'description': '平稳动量3-5-反弹综合拥挤过滤动量因子'
     },
     'momentum_amplitude_cut': {
         'func': factor_.momentum_amplitude_cut,
         'base_warmup': 0,
         'window_multiplier': 1,
-        'lookback_windows': [120],  # 研报最优参数：N=160天（约8个月）
+        'lookback_windows': [20, 60, 90, 120, 160, 240],  # 行业最优参数测试
         'requires_constituent': False,
-        'description': '平稳动量5-5-振幅切割稳健动量因子（开源证券A因子）'
+        'description': '平稳动量4-5-振幅切割稳健动量因子（剔高振幅）'
+    },
+    'momentum_price_volume_icir': {
+        'func': factor_.momentum_price_volume_icir,
+        'base_warmup': 240,
+        'window_multiplier': 0,
+        'lookback_windows': [240], #固定使用10-240日
+        'requires_constituent': False,
+        'description': '平稳动量5-5-量价清洗ICIR加权动量因子（剔高成交量）'
     },
 
     # ===== 特质收益动量因子 =====
@@ -131,7 +135,7 @@ FACTOR_CONFIG = {
         'window_multiplier': 1,
         'lookback_windows': None,
         'requires_constituent': False,
-        'description': '特质动量1-2-剥离流动性提纯动量因子（特质收益）'
+        'description': '特质动量1-2-剥离异动提纯动量因子（特质收益）'
     },
     'momentum_residual': {
         'func': factor_.momentum_residual,
@@ -139,6 +143,7 @@ FACTOR_CONFIG = {
         'window_multiplier': 0,  # 研报固定使用12个月，不依赖window参数
         'lookback_windows': [240],  # 固定窗口，研报使用12个月回看
         'requires_constituent': False,
+        'requires_barra': True,  # 需要Barra因子数据
         'description': '特质动量2-2-行业残差动量因子Barra兴业'
     },
 
@@ -156,19 +161,10 @@ FACTOR_CONFIG = {
     'momentum_industry_component': {
         'func': factor_.momentum_industry_component,
         'base_warmup': 0,  # 无额外固定预热期
-        'window_multiplier': 20,  # window是月数，预热期 = window * 20（交易日）
-        'lookback_windows': [1, 3, 6, 12, 24, 36],  # 月数（研报原文：1、3、6、12、24、36个月）
+        'window_multiplier': 1,  # window已经是交易日数，预热期 = window * 1
+        'lookback_windows': [20, 60, 120, 240, 480, 720],  # 交易日数（对应1、3、6、12、24、36个月）
         'requires_constituent': True,
         'description': '行业内动量1-3-行业成分股动量因子 东方'
-    },
-    'momentum_pca': {
-        'func': factor_.momentum_pca,
-        'base_warmup': 125,  # pca_window(120) + lag(5) = 125
-        'window_multiplier': 0,  # 动量窗口固定为10天（双周），不使用外部window
-        'lookback_windows': [120],  # 固定窗口，与研报一致
-        'requires_constituent': True,
-        'rebalance_type': 'weekly',  # 研报使用周度调仓
-        'description': '行业内动量2-3-PcaMom集中度分析因子'
     },
     'momentum_lead_lag_enhanced': {
         'func': factor_.momentum_lead_lag_enhanced,
@@ -177,7 +173,37 @@ FACTOR_CONFIG = {
         'lookback_windows': None,  # 原文固定使用20日窗口（1个月）
         'requires_constituent': True,
         'default_split_ratio': 0.1,  # 最优分割参数（测试结果：0.4表现最好）
-        'description': '行业内动量3-3-龙头领先修正动量因子'
+        'description': '行业内动量2-3-龙头领先修正动量因子'
+    },
+    'momentum_pca': {
+        'func': factor_.momentum_pca,
+        'base_warmup': 125,  # pca_window(120) + lag(5) = 125
+        'window_multiplier': 0,  # 动量窗口固定为10天（双周），不使用外部window
+        'lookback_windows': [120],  # 固定窗口，与研报一致
+        'requires_constituent': True,
+        'rebalance_type': 'weekly',  # 研报使用周度调仓
+        'description': '行业内动量3-3-PcaMom集中度分析因子'
+    },
+
+    # ===== 多因子合成因子 =====
+    # 注意：这两个因子的window参数无实际意义，各成分因子使用各自的最优窗口
+    'momentum_synthesis_equal': {
+        'func': factor_.momentum_synthesis_equal,
+        'base_warmup': 240,  # 最大成分因子窗口（用于预热期计算）
+        'window_multiplier': 0,
+        'lookback_windows': [1],  # 占位符，实际不使用window参数
+        'requires_constituent': True,
+        'requires_barra': True,
+        'description': '合成因子1-等权合成动量因子'
+    },
+    'momentum_synthesis_icir': {
+        'func': factor_.momentum_synthesis_icir,
+        'base_warmup': 240,  # 最大成分因子窗口（用于预热期计算）
+        'window_multiplier': 0,
+        'lookback_windows': [1],  # 占位符，实际不使用window参数
+        'requires_constituent': True,
+        'requires_barra': True,
+        'description': '合成因子2-滚动ICIR加权合成动量因子(12月)'
     },
 }
 
@@ -430,19 +456,31 @@ class DataContainer:
         if exclude_incomplete_month and len(self.prices_df) > 0:
             self._exclude_incomplete_month()
 
-        # 计算回测日期范围
+        # 计算回测日期范围（不含Barra的因子）
         self.first_holding_date = None
         self.last_holding_date = None
         if backtest_years is not None and self.last_complete_month_end is not None:
             self._calculate_backtest_dates(backtest_years)
 
+        # 计算Barra因子的回测日期范围（含Barra的因子）
+        self.barra_first_holding_date = None
+        self.barra_last_holding_date = None
+        self.barra_last_complete_month_end = None
+        if backtest_years is not None and self.barra_common_end is not None:
+            self._calculate_barra_backtest_dates(backtest_years)
+
         print(f"数据加载完成: {self.prices_df.shape[0]}个交易日, {self.prices_df.shape[1]}个行业")
 
         # 打印回测日期信息
         if self.first_holding_date and self.last_holding_date:
-            print(f"  回测日期范围:")
+            print(f"  回测日期范围(不含Barra):")
             print(f"    最早持仓日: {self.first_holding_date}")
             print(f"    最晚持仓日: {self.last_holding_date.strftime('%Y-%m-%d')}")
+
+        if self.barra_first_holding_date and self.barra_last_holding_date:
+            print(f"  回测日期范围(含Barra):")
+            print(f"    最早持仓日: {self.barra_first_holding_date}")
+            print(f"    最晚持仓日: {self.barra_last_holding_date.strftime('%Y-%m-%d')}")
 
         if self.last_complete_month_end and self.original_last_date:
             if self.last_complete_month_end != self.original_last_date:
@@ -470,35 +508,53 @@ class DataContainer:
 
     def _align_date_range(self):
         """
-        自动计算所有数据源的日期交集，确保所有因子使用相同的日期范围
+        自动计算数据源的日期交集
+        分别计算两个日期范围：
+        1. 不含Barra的日期范围（用于大多数因子）
+        2. 含Barra的日期范围（用于需要Barra的因子，如momentum_residual）
         """
-        # 收集所有数据源的日期范围
-        date_ranges = []
+        # 收集基础数据源的日期范围（不含Barra）
+        base_date_ranges = []
 
         # 行业指数数据（必须有）
-        date_ranges.append((self.prices_df.index.min(), self.prices_df.index.max(), '行业指数'))
-
-        # Barra因子数据（如果有）
-        if self.barra_factor_returns_df is not None:
-            date_ranges.append((self.barra_factor_returns_df.index.min(),
-                               self.barra_factor_returns_df.index.max(), 'Barra因子'))
+        base_date_ranges.append((self.prices_df.index.min(), self.prices_df.index.max(), '行业指数'))
 
         # 成分股数据（如果有）
         if self.stock_price_df is not None:
-            date_ranges.append((self.stock_price_df.index.min(),
+            base_date_ranges.append((self.stock_price_df.index.min(),
                                self.stock_price_df.index.max(), '个股价格'))
         if self.stock_mv_df is not None:
-            date_ranges.append((self.stock_mv_df.index.min(),
+            base_date_ranges.append((self.stock_mv_df.index.min(),
                                self.stock_mv_df.index.max(), '个股市值'))
 
-        # 计算交集
-        common_start = max(r[0] for r in date_ranges)
-        common_end = min(r[1] for r in date_ranges)
+        # 计算不含Barra的交集（用于大多数因子）
+        common_start_no_barra = max(r[0] for r in base_date_ranges)
+        common_end_no_barra = min(r[1] for r in base_date_ranges)
 
-        # 打印数据交集范围（原始数据范围）
-        print(f"  数据交集范围: {common_start.date()} 至 {common_end.date()}")
+        # 打印不含Barra的数据交集范围
+        print(f"  数据交集范围(不含Barra): {common_start_no_barra.date()} 至 {common_end_no_barra.date()}")
 
-        # 截断所有数据到交集范围
+        # 计算含Barra的交集（用于需要Barra的因子）
+        if self.barra_factor_returns_df is not None:
+            barra_date_ranges = base_date_ranges.copy()
+            barra_date_ranges.append((self.barra_factor_returns_df.index.min(),
+                                     self.barra_factor_returns_df.index.max(), 'Barra因子'))
+            common_start_with_barra = max(r[0] for r in barra_date_ranges)
+            common_end_with_barra = min(r[1] for r in barra_date_ranges)
+            print(f"  数据交集范围(含Barra): {common_start_with_barra.date()} 至 {common_end_with_barra.date()}")
+
+            # 保存Barra日期范围
+            self.barra_common_start = common_start_with_barra
+            self.barra_common_end = common_end_with_barra
+        else:
+            self.barra_common_start = None
+            self.barra_common_end = None
+
+        # 使用不含Barra的日期范围作为主数据范围
+        common_start = common_start_no_barra
+        common_end = common_end_no_barra
+
+        # 截断主数据到交集范围（不含Barra）
         self.prices_df = self.prices_df[(self.prices_df.index >= common_start) & (self.prices_df.index <= common_end)]
         self.high_df = self.high_df[(self.high_df.index >= common_start) & (self.high_df.index <= common_end)]
         self.low_df = self.low_df[(self.low_df.index >= common_start) & (self.low_df.index <= common_end)]
@@ -506,8 +562,8 @@ class DataContainer:
         self.volume_df = self.volume_df[(self.volume_df.index >= common_start) & (self.volume_df.index <= common_end)]
         self.amount_df = self.amount_df[(self.amount_df.index >= common_start) & (self.amount_df.index <= common_end)]
 
-        if self.barra_factor_returns_df is not None:
-            self.barra_factor_returns_df = self.barra_factor_returns_df[(self.barra_factor_returns_df.index >= common_start) & (self.barra_factor_returns_df.index <= common_end)]
+        # Barra数据保持原样，不截断（在使用时根据需要截断）
+        # 这样需要Barra的因子可以使用更短的日期范围
 
         if self.stock_price_df is not None:
             self.stock_price_df = self.stock_price_df[(self.stock_price_df.index >= common_start) & (self.stock_price_df.index <= common_end)]
@@ -572,6 +628,46 @@ class DataContainer:
             if self.data_start.month > 1 or (self.data_start.month == 1 and self.data_start.day > 1):
                 first_year += 1
             self.first_holding_date = f"{first_year}-12-31"
+
+    def _calculate_barra_backtest_dates(self, backtest_years):
+        """
+        计算需要Barra因子的回测日期范围
+
+        Barra因子的最早持仓日与不含Barra的因子保持一致，
+        只是最晚持仓日受Barra数据结束日期限制
+
+        参数:
+        backtest_years: int, 回测年限
+        """
+        if self.barra_common_end is None:
+            return
+
+        # 获取Barra日期范围内的最后一个完整月末
+        barra_prices = self.prices_df[
+            (self.prices_df.index >= self.barra_common_start) &
+            (self.prices_df.index <= self.barra_common_end)
+        ]
+        self.barra_last_complete_month_end = get_last_complete_month_end(barra_prices.index)
+
+        if self.barra_last_complete_month_end is None:
+            return
+
+        # 最晚持仓日 = Barra范围内的最后一个完整月末
+        self.barra_last_holding_date = self.barra_last_complete_month_end
+
+        # 最早持仓日 = 与不含Barra的因子保持一致
+        # 使用不含Barra的最早持仓日
+        self.barra_first_holding_date = self.first_holding_date
+
+        # 检查数据是否足够
+        if self.barra_first_holding_date is not None:
+            first_holding_ts = pd.Timestamp(self.barra_first_holding_date)
+            if first_holding_ts < self.barra_common_start:
+                # 数据不够，从Barra数据起始后的第一个12月31日开始
+                first_year = self.barra_common_start.year
+                if self.barra_common_start.month > 1 or (self.barra_common_start.month == 1 and self.barra_common_start.day > 1):
+                    first_year += 1
+                self.barra_first_holding_date = f"{first_year}-12-31"
 
 
 def get_factor_docstring(factor_name):
@@ -772,17 +868,8 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
         # 窗口参数（所有因子统一使用 window）
         'window': window,
         'rebalance_freq': rebalance_freq,
-        # 其他参数
-        'zscore_window': 240,
-        'smooth_window': 3,
-        'min_industries': 15,
-        'train_periods': 60,
+        # 其他参数（仅保留无默认值的必需参数）
         'benchmark_returns': benchmark_returns,
-        # PCA因子参数（根据兴业研报《分歧和共振》设置）
-        # pca_window: 120天（研报第8页："过去n天（在这里设定为120天）涨跌幅"）
-        # lag: 5天（约1周，研报使用PcaScore_t / PcaScore_{t-1}，周度调仓）
-        'pca_window': 120,
-        'lag': 5,
         # 残差动量因子参数（月频版本使用价格数据）
         'industry_prices_df': data.prices_df,
         'barra_factor_returns_df': data.barra_factor_returns_df,
@@ -1059,32 +1146,54 @@ def calculate_forward_returns_by_type(prices_df, all_trade_dates, rebalance_type
         raise ValueError(f"未知的调仓类型: {rebalance_type}")
 
 
-def calc_rank_ic(factor_series, return_series):
+def calc_pearson_ic(factor_series, return_series):
     """
-    计算Rank IC (Spearman相关系数)
-    
+    计算Pearson IC (Pearson相关系数)
+
     参数:
         factor_series: pd.Series, 因子值序列
         return_series: pd.Series, 收益率序列
-    
+
+    返回:
+        float, Pearson IC值
+    """
+    valid_mask = factor_series.notna() & return_series.notna()
+    if valid_mask.sum() < 3:
+        return np.nan
+
+    factor_valid = factor_series[valid_mask]
+    return_valid = return_series[valid_mask]
+
+    ic, _ = stats.pearsonr(factor_valid, return_valid)
+    return ic
+
+
+def calc_rank_ic(factor_series, return_series):
+    """
+    计算Rank IC (Spearman相关系数)
+
+    参数:
+        factor_series: pd.Series, 因子值序列
+        return_series: pd.Series, 收益率序列
+
     返回:
         float, Rank IC值
     """
     valid_mask = factor_series.notna() & return_series.notna()
     if valid_mask.sum() < 3:
         return np.nan
-    
+
     factor_valid = factor_series[valid_mask]
     return_valid = return_series[valid_mask]
-    
+
     ic, _ = stats.spearmanr(factor_valid, return_valid)
     return ic
 
 
 def calculate_ic_ir(factor_df, forward_returns_df, rebalance_freq=DEFAULT_REBALANCE_FREQ, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, unified_start_date=None, rebalance_type=None):
     """
-    计算因子的 IC 和 IR
-    
+    计算因子的 Pearson IC 和 Rank IC 及其 IR
+
     参数:
         factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
         forward_returns_df: pd.DataFrame, 未来收益率 (index=日期, columns=行业)
@@ -1092,12 +1201,12 @@ def calculate_ic_ir(factor_df, forward_returns_df, rebalance_freq=DEFAULT_REBALA
         monthly_rebalance: bool, 是否按月调仓，默认为 True (每月最后一个交易日调仓)
         unified_start_date: pd.Timestamp, 统一的回测起始日期（如果指定，只计算该日期之后的IC）
         rebalance_type: str, 调仓类型: 'monthly', 'weekly', 'fixed'（优先级高于 monthly_rebalance）
-    
+
     返回:
-        tuple: (ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean)
+        dict: 包含 Pearson IC 和 Rank IC 的所有指标
     """
     all_dates = factor_df.index
-    
+
     # 优先使用 rebalance_type 参数
     if rebalance_type is not None:
         rebalance_dates = get_rebalance_dates_by_type(all_dates, rebalance_type, rebalance_freq)
@@ -1108,95 +1217,124 @@ def calculate_ic_ir(factor_df, forward_returns_df, rebalance_freq=DEFAULT_REBALA
         # 按固定频率调仓
         rebalance_indices = list(range(0, len(all_dates), rebalance_freq))
         rebalance_dates = all_dates[rebalance_indices]
-    
+
     # 如果指定了统一起始日期，过滤调仓日期
     if unified_start_date is not None:
         rebalance_dates = rebalance_dates[rebalance_dates >= unified_start_date]
-    
-    # 计算每个调仓日的IC
-    ic_list = []
+
+    # 计算每个调仓日的 Pearson IC 和 Rank IC
+    pearson_ic_list = []
+    rank_ic_list = []
     ic_dates = []
-    
+
     for date in rebalance_dates:
         if date not in factor_df.index or date not in forward_returns_df.index:
             continue
-        
-        ic = calc_rank_ic(factor_df.loc[date], forward_returns_df.loc[date])
-        
-        if not np.isnan(ic):
-            ic_list.append(ic)
+
+        pearson_ic = calc_pearson_ic(factor_df.loc[date], forward_returns_df.loc[date])
+        rank_ic = calc_rank_ic(factor_df.loc[date], forward_returns_df.loc[date])
+
+        if not np.isnan(pearson_ic) and not np.isnan(rank_ic):
+            pearson_ic_list.append(pearson_ic)
+            rank_ic_list.append(rank_ic)
             ic_dates.append(date)
-    
+
     # 构建IC时间序列
-    ic_series = pd.Series(ic_list, index=ic_dates)
-    
+    pearson_ic_series = pd.Series(pearson_ic_list, index=ic_dates)
+    rank_ic_series = pd.Series(rank_ic_list, index=ic_dates)
+
     # 计算IC累积序列
-    ic_cumsum = ic_series.cumsum()
-    
-    # 计算统计指标
-    ic_mean = ic_series.mean() if len(ic_series) > 0 else np.nan
-    ic_std = ic_series.std() if len(ic_series) > 0 else np.nan
-    icir = ic_mean / ic_std if ic_std > 0 else np.nan
-    ic_win_rate = (ic_series > 0).sum() / len(ic_series) if len(ic_series) > 0 else np.nan
-    ic_abs_mean = ic_series.abs().mean() if len(ic_series) > 0 else np.nan
-    
-    return ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean
+    pearson_ic_cumsum = pearson_ic_series.cumsum()
+    rank_ic_cumsum = rank_ic_series.cumsum()
+
+    # 计算 Pearson IC 统计指标
+    pearson_ic_mean = pearson_ic_series.mean() if len(pearson_ic_series) > 0 else np.nan
+    pearson_ic_std = pearson_ic_series.std() if len(pearson_ic_series) > 0 else np.nan
+    pearson_icir = pearson_ic_mean / pearson_ic_std if pearson_ic_std > 0 else np.nan
+
+    # 计算 Rank IC 统计指标
+    rank_ic_mean = rank_ic_series.mean() if len(rank_ic_series) > 0 else np.nan
+    rank_ic_std = rank_ic_series.std() if len(rank_ic_series) > 0 else np.nan
+    rank_icir = rank_ic_mean / rank_ic_std if rank_ic_std > 0 else np.nan
+
+    # IC胜率（使用 Rank IC）
+    ic_win_rate = (rank_ic_series > 0).sum() / len(rank_ic_series) if len(rank_ic_series) > 0 else np.nan
+
+    return {
+        # Pearson IC 相关
+        'pearson_ic_series': pearson_ic_series,
+        'pearson_ic_cumsum': pearson_ic_cumsum,
+        'pearson_ic_mean': pearson_ic_mean,
+        'pearson_icir': pearson_icir,
+        # Rank IC 相关
+        'rank_ic_series': rank_ic_series,
+        'rank_ic_cumsum': rank_ic_cumsum,
+        'rank_ic_mean': rank_ic_mean,
+        'rank_icir': rank_icir,
+        # 通用指标
+        'ic_win_rate': ic_win_rate,
+    }
 
 
-def get_latest_month_holdings(factor_df, prices_df, window, n_layers=N_LAYERS, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE):
+def get_latest_month_holdings(factor_df, prices_df, window, n_layers=N_LAYERS, monthly_rebalance=DEFAULT_MONTHLY_REBALANCE, last_complete_month_end=None):
     """
-    获取最新月份的分层持仓（包括不完整月份）
-    用于输出最新的选股结果，即使该月份还没有完整的收益数据
-    
+    获取最后一个完整月末的分层持仓（不包括不完整月份）
+    用于补充回测中可能遗漏的最后一个调仓日持仓
+
     参数:
     factor_df: pd.DataFrame, 因子值 (index=日期, columns=行业)
     prices_df: pd.DataFrame, 价格数据
     window: int, 回溯窗口
     n_layers: int, 分层数
     monthly_rebalance: bool, 是否按月调仓
-    
+    last_complete_month_end: pd.Timestamp, 最后一个完整月末日期
+
     返回:
-    dict: {layer_idx: {date: [行业列表]}} 最新月份的持仓
+    dict: {layer_idx: {date: [行业列表]}} 最后一个完整月末的持仓
     """
     all_dates = factor_df.index
-    
+
     if not monthly_rebalance:
         return {}
-    
-    # 获取所有月末日期（包括不完整月份）
+
+    # 获取所有月末日期
     all_month_ends = get_monthly_rebalance_dates(all_dates)
-    
+
     if len(all_month_ends) == 0:
         return {}
-    
-    # 获取最新的月末日期
-    latest_month_end = all_month_ends[-1]
-    
+
+    # 如果指定了最后一个完整月末，只获取该日期的持仓
+    # 否则获取最后一个月末的持仓
+    if last_complete_month_end is not None:
+        target_date = last_complete_month_end
+    else:
+        target_date = all_month_ends[-1]
+
     # 确保该日期在因子数据中存在
-    if latest_month_end not in factor_df.index:
+    if target_date not in factor_df.index:
         return {}
-    
+
     # 获取该日期的因子值
-    fac = factor_df.loc[latest_month_end]
+    fac = factor_df.loc[target_date]
     valid_mask = ~fac.isna()
     fac = fac[valid_mask]
-    
+
     if len(fac) < n_layers * 2:
         return {}
-    
+
     # 按因子值排序并分层
     sorted_assets = fac.sort_values(ascending=True)
     n_assets = len(sorted_assets)
     layer_size = n_assets // n_layers
-    
+
     latest_holdings = {i: {} for i in range(n_layers)}
-    
+
     for layer in range(n_layers):
         start_idx = layer * layer_size
         end_idx = start_idx + layer_size if layer < n_layers - 1 else n_assets
         layer_assets = sorted_assets.index[start_idx:end_idx].tolist()
-        latest_holdings[layer][latest_month_end] = layer_assets
-    
+        latest_holdings[layer][target_date] = layer_assets
+
     return latest_holdings
 
 
@@ -1262,44 +1400,48 @@ def stratified_backtest(factor_df, prices_df, window, rebalance_freq=DEFAULT_REB
     # 确保调仓日期在 prices_df 中存在
     valid_dates = [d for d in rebalance_dates_raw if d in prices_df.index]
 
+    if not valid_dates:
+        nav_df = pd.DataFrame()
+        return nav_df, pd.DataFrame(), {}
+
     layer_nav = {i: [1.0] for i in range(n_layers)}
-    nav_dates = [valid_dates[0]] if valid_dates else []
+    nav_dates = [valid_dates[0]]  # 第一个调仓日，净值=1.0
     layer_holdings_history = {i: {} for i in range(n_layers)}  # 记录每期每层持仓
-    
+
     for i, date in enumerate(valid_dates[:-1]):
         next_date = valid_dates[i + 1]
-        
+
         fac = factor_df.loc[date]
         valid_mask = ~fac.isna()
         fac = fac[valid_mask]
-        
+
         if len(fac) < n_layers * 2:
             for layer in range(n_layers):
                 layer_nav[layer].append(layer_nav[layer][-1])
             nav_dates.append(next_date)
             continue
-        
+
         # 按因子值排序并分层（升序：G1=因子值最小，G5=因子值最大）
         sorted_assets = fac.sort_values(ascending=True)
         n_assets = len(sorted_assets)
         layer_size = n_assets // n_layers
-        
+
         holding_period = daily_returns.loc[date:next_date].iloc[1:]
         for layer in range(n_layers):
             start_idx = layer * layer_size
             end_idx = start_idx + layer_size if layer < n_layers - 1 else n_assets
             layer_assets = sorted_assets.index[start_idx:end_idx].tolist()
-            
-            # 记录持仓
+
+            # 记录持仓（在调仓日记录）
             layer_holdings_history[layer][date] = layer_assets
-            
+
             if layer_assets and len(holding_period) > 0:
                 layer_ret = holding_period[layer_assets].mean(axis=1)
                 cumulative_ret = (1 + layer_ret).prod() - 1
                 layer_nav[layer].append(layer_nav[layer][-1] * (1 + cumulative_ret))
             else:
                 layer_nav[layer].append(layer_nav[layer][-1])
-        
+
         nav_dates.append(next_date)
     
     nav_df = pd.DataFrame(layer_nav, index=nav_dates)
@@ -1324,17 +1466,20 @@ def calculate_excess_metrics(nav_df, benchmark_nav, rebalance_freq=DEFAULT_REBAL
     dict: 各层的超额收益指标
     """
     results = {}
-    
+
     start_date = nav_df.index[0]
     end_date = nav_df.index[-1]
-    years = (end_date - start_date).days / 365.25
-    # 根据调仓类型计算每年调仓周期数
+
+    # 根据调仓类型计算年数和每年周期数
     if rebalance_type == 'weekly':
         periods_per_year = 52  # 周度调仓，每年约52周
+        years = len(nav_df) / 52  # 用周数计算年数
     elif rebalance_type == 'monthly' or monthly_rebalance:
         periods_per_year = 12  # 月度调仓
+        years = len(nav_df) / 12  # 用月数计算年数
     else:
         periods_per_year = 252 / rebalance_freq
+        years = len(nav_df) / periods_per_year  # 用周期数计算年数
     
     # 计算基准收益率序列
     benchmark_returns = benchmark_nav.pct_change().dropna()
@@ -1432,15 +1577,35 @@ def calculate_yearly_returns(nav_df, benchmark_nav, start_year=None, last_comple
 
     yearly_data = []
 
-    for year in years:
+    for i, year in enumerate(years):
         # 获取该年的数据
         year_mask = nav_df.index.year == year
         year_dates = nav_df.index[year_mask]
 
-        if len(year_dates) < 2:
+        if len(year_dates) == 0:
             continue
 
-        start_date = year_dates[0]
+        # 年度收益的起始日期：
+        # - 第一年：使用上一年的最后一个日期（即初始持仓日）
+        # - 其他年：使用上一年的最后一个日期
+        if i == 0:
+            # 第一年：找到该年之前的最后一个日期（初始持仓日）
+            prev_year_mask = nav_df.index.year < year
+            if prev_year_mask.any():
+                start_date = nav_df.index[prev_year_mask][-1]
+            else:
+                # 如果没有上一年数据，使用该年第一个日期
+                start_date = year_dates[0]
+        else:
+            # 其他年：使用上一年的最后一个日期
+            prev_year = years[i - 1]
+            prev_year_mask = nav_df.index.year == prev_year
+            prev_year_dates = nav_df.index[prev_year_mask]
+            if len(prev_year_dates) > 0:
+                start_date = prev_year_dates[-1]
+            else:
+                start_date = year_dates[0]
+
         end_date = year_dates[-1]
 
         # G5多头收益
@@ -1465,21 +1630,29 @@ def calculate_yearly_returns(nav_df, benchmark_nav, start_year=None, last_comple
         })
     
     # 添加全样本统计
-    if len(nav_df) >= 2:
-        # 寻找大于等于 start_year 的第一个有效日期作为全样本起始日期
-        full_sample_start_date_mask = nav_df.index.year >= start_year
-        if not full_sample_start_date_mask.any():
-            # 如果没有符合条件的年份，则不计算全样本
-            return pd.DataFrame(yearly_data)
+    if len(nav_df) >= 2 and len(years) > 0:
+        # 全样本起始日期：初始持仓日（第一年之前的最后一个日期，即净值=1.0的日期）
+        first_year = years[0]
+        prev_year_mask = nav_df.index.year < first_year
 
-        first_valid_date_for_full_sample = nav_df.index[full_sample_start_date_mask][0]
-        
+        if prev_year_mask.any():
+            # 有上一年数据，使用上一年最后一个日期（初始持仓日）
+            first_valid_date_for_full_sample = nav_df.index[prev_year_mask][-1]
+        else:
+            # 没有上一年数据，使用第一年的第一个日期
+            first_year_mask = nav_df.index.year == first_year
+            first_year_dates = nav_df.index[first_year_mask]
+            if len(first_year_dates) > 0:
+                first_valid_date_for_full_sample = first_year_dates[0]
+            else:
+                first_valid_date_for_full_sample = nav_df.index[0]
+
         # 确保起始日期在g5_nav和benchmark_nav中存在
         if first_valid_date_for_full_sample in g5_nav.index and first_valid_date_for_full_sample in benchmark_nav.index:
             total_g5_return = (g5_nav.iloc[-1] / g5_nav.loc[first_valid_date_for_full_sample] - 1) * 100
             total_bench_return = (benchmark_nav.iloc[-1] / benchmark_nav.loc[first_valid_date_for_full_sample] - 1) * 100
             total_excess_return = total_g5_return - total_bench_return
-            
+
             yearly_data.append({
                 '年份': '全样本',
                 'G5多头收益(%)': round(total_g5_return, 2),
@@ -1510,67 +1683,97 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
     """
     # 检查因子配置中是否有特定的 rebalance_type
     factor_rebalance_type = None
+    requires_barra = False
     if factor_name in FACTOR_CONFIG:
         factor_rebalance_type = FACTOR_CONFIG[factor_name].get('rebalance_type', None)
+        requires_barra = FACTOR_CONFIG[factor_name].get('requires_barra', False)
 
     # 如果因子配置了特定的调仓类型，使用该类型
     if factor_rebalance_type is not None:
         print(f"    使用因子配置的调仓类型: {factor_rebalance_type}")
 
+    # 根据因子是否需要Barra数据，选择使用的价格数据范围
+    if requires_barra and hasattr(data, 'barra_common_start') and data.barra_common_start is not None:
+        # 需要Barra的因子，使用含Barra的日期范围
+        prices_df_for_analysis = data.prices_df[
+            (data.prices_df.index >= data.barra_common_start) &
+            (data.prices_df.index <= data.barra_common_end)
+        ]
+        print(f"    使用含Barra的日期范围: {data.barra_common_start.date()} 至 {data.barra_common_end.date()}")
+    else:
+        # 不需要Barra的因子，使用完整的日期范围
+        prices_df_for_analysis = data.prices_df
+
     # 计算因子值（传入split_ratio参数）
     factor_df = compute_factor(factor_name, data, window, rebalance_freq, split_ratio=split_ratio)
-    
+
+    # 如果需要Barra，截断因子数据到Barra日期范围
+    if requires_barra and hasattr(data, 'barra_common_start') and data.barra_common_start is not None:
+        factor_df = factor_df[
+            (factor_df.index >= data.barra_common_start) &
+            (factor_df.index <= data.barra_common_end)
+        ]
+
     # 获取最后一个完整月末日期（用于排除不完整月份的收益计算）
     last_complete_month_end = None
     if (factor_rebalance_type == 'monthly' or (factor_rebalance_type is None and monthly_rebalance)) and hasattr(data, 'last_complete_month_end'):
         last_complete_month_end = data.last_complete_month_end
-    
+        # 如果需要Barra，使用Barra日期范围内的最后完整月末
+        if requires_barra and hasattr(data, 'barra_common_end') and data.barra_common_end is not None:
+            if last_complete_month_end is not None and last_complete_month_end > data.barra_common_end:
+                # 重新计算Barra范围内的最后完整月末
+                last_complete_month_end = get_last_complete_month_end(prices_df_for_analysis.index)
+
     # 计算未来收益率（根据调仓类型）
     if factor_rebalance_type is not None:
         forward_returns_df = calculate_forward_returns_by_type(
-            data.prices_df, data.prices_df.index, factor_rebalance_type, rebalance_freq
+            prices_df_for_analysis, prices_df_for_analysis.index, factor_rebalance_type, rebalance_freq
         )
     elif monthly_rebalance:
         # 月度调仓：计算从当前月末到下一个月末的收益率
-        forward_returns_df = calculate_monthly_forward_returns(data.prices_df, data.prices_df.index)
+        forward_returns_df = calculate_monthly_forward_returns(prices_df_for_analysis, prices_df_for_analysis.index)
     else:
         # 固定频率调仓：使用固定周期的未来收益率
-        forward_returns_df = data.prices_df.pct_change(rebalance_freq).shift(-rebalance_freq)
+        forward_returns_df = prices_df_for_analysis.pct_change(rebalance_freq).shift(-rebalance_freq)
     
-    # 计算IC/IR（包含IC累积序列）
+    # 计算IC/IR（包含 Pearson IC 和 Rank IC 累积序列）
     # 注意：IC计算需要完整的未来收益率，不完整月份的IC会自动被排除（因为forward_returns为NaN）
-    ic_series, ic_cumsum, ic_mean, ic_std, icir, ic_win_rate, ic_abs_mean = calculate_ic_ir(
+    ic_results = calculate_ic_ir(
         factor_df, forward_returns_df, rebalance_freq=rebalance_freq, monthly_rebalance=monthly_rebalance,
         unified_start_date=unified_start_date, rebalance_type=factor_rebalance_type
     )
-    
+
     # 分层回测（传入最后一个完整月末日期，排除不完整月份的收益计算）
+    # 使用对应的价格数据（需要Barra的因子使用截断后的价格数据）
     nav_df, layer_returns, layer_holdings = stratified_backtest(
-        factor_df, data.prices_df, window, rebalance_freq=rebalance_freq, monthly_rebalance=monthly_rebalance,
+        factor_df, prices_df_for_analysis, window, rebalance_freq=rebalance_freq, monthly_rebalance=monthly_rebalance,
         last_complete_month_end=last_complete_month_end, unified_start_date=unified_start_date,
         rebalance_type=factor_rebalance_type
     )
-    
-    # 获取最新月份的持仓（包括不完整月份，用于输出最新选股结果）
+
+    # 获取最后一个完整月末的持仓（补充回测中可能遗漏的最后一个调仓日持仓）
     if monthly_rebalance:
-        latest_holdings = get_latest_month_holdings(factor_df, data.prices_df, window, N_LAYERS, monthly_rebalance)
-        # 合并最新持仓到 layer_holdings（如果最新月份不在回测持仓中）
+        latest_holdings = get_latest_month_holdings(factor_df, prices_df_for_analysis, window, N_LAYERS, monthly_rebalance, last_complete_month_end)
+        # 合并最新持仓到 layer_holdings（如果该日期不在回测持仓中）
         for layer_idx, holdings in latest_holdings.items():
             for date, assets in holdings.items():
                 if date not in layer_holdings.get(layer_idx, {}):
                     if layer_idx not in layer_holdings:
                         layer_holdings[layer_idx] = {}
                     layer_holdings[layer_idx][date] = assets
-    
+
     # 计算基准净值（等权行业指数）
-    # 对齐到调仓日期
+    # 对齐到调仓日期，使用对应的价格数据
     benchmark_nav = pd.Series(index=nav_df.index, dtype=float)
     benchmark_nav.iloc[0] = 1.0
     for i in range(1, len(nav_df.index)):
         prev_date = nav_df.index[i-1]
         curr_date = nav_df.index[i]
         # 计算期间基准收益（所有行业等权平均）
-        period_ret = (data.prices_df.loc[curr_date] / data.prices_df.loc[prev_date] - 1).mean()
+        if prev_date in prices_df_for_analysis.index and curr_date in prices_df_for_analysis.index:
+            period_ret = (prices_df_for_analysis.loc[curr_date] / prices_df_for_analysis.loc[prev_date] - 1).mean()
+        else:
+            period_ret = 0
         benchmark_nav.iloc[i] = benchmark_nav.iloc[i-1] * (1 + period_ret)
     
     # 计算超额指标
@@ -1588,12 +1791,19 @@ def analyze_single_factor_window(factor_name, data: DataContainer, window, rebal
                                               last_complete_month_end=last_complete_month_end)
     
     return {
-        'ic_mean': ic_mean,
-        'icir': icir,
-        'ic_win_rate': ic_win_rate,
-        'ic_abs_mean': ic_abs_mean,
-        'ic_series': ic_series,
-        'ic_cumsum': ic_cumsum,
+        # Pearson IC 相关
+        'ic_mean': ic_results['pearson_ic_mean'],
+        'icir': ic_results['pearson_icir'],
+        'ic_series': ic_results['pearson_ic_series'],
+        'ic_cumsum': ic_results['pearson_ic_cumsum'],
+        # Rank IC 相关
+        'rank_ic_mean': ic_results['rank_ic_mean'],
+        'rank_icir': ic_results['rank_icir'],
+        'rank_ic_series': ic_results['rank_ic_series'],
+        'rank_ic_cumsum': ic_results['rank_ic_cumsum'],
+        # 通用指标
+        'ic_win_rate': ic_results['ic_win_rate'],
+        # 回测结果
         'nav_df': nav_df,
         'benchmark_nav': benchmark_nav,
         'excess_metrics': excess_metrics,
@@ -1618,7 +1828,10 @@ def analyze_all_factors(data: DataContainer, windows=LOOKBACK_WINDOWS, rebalance
     返回:
     dict: {factor_name: {window: analysis_result}}
     """
+    import time
+
     all_results = {}
+    factor_timing = {}  # 记录每个因子的耗时
 
     # 打印预热期分析
     if use_unified_start_date:
@@ -1626,12 +1839,40 @@ def analyze_all_factors(data: DataContainer, windows=LOOKBACK_WINDOWS, rebalance
         print("各因子预热期分析（每个因子内部不同窗口使用统一起始日期）")
         print("=" * 60)
 
-    for factor_name in FACTOR_CONFIG.keys():
+    total_start_time = time.time()
+    factor_list = list(FACTOR_CONFIG.keys())
+
+    for i, factor_name in enumerate(factor_list):
+        factor_start_time = time.time()
+
         # 调用单因子分析函数
         factor_results = analyze_single_factor(
             factor_name, data, windows, rebalance_freq, monthly_rebalance, use_unified_start_date
         )
         all_results.update(factor_results)
+
+        # 计算该因子耗时
+        factor_elapsed = time.time() - factor_start_time
+        factor_minutes = int(factor_elapsed // 60)
+        factor_seconds = int(factor_elapsed % 60)
+        factor_timing[factor_name] = factor_minutes
+
+        # 打印进度和耗时
+        print(f"  ✓ {factor_name} 完成 ({i+1}/{len(factor_list)}) - 耗时: {factor_minutes}分{factor_seconds}秒")
+
+    # 打印总耗时
+    total_elapsed = time.time() - total_start_time
+    total_hours = int(total_elapsed // 3600)
+    total_minutes = int((total_elapsed % 3600) // 60)
+    print("\n" + "=" * 60)
+    print("因子分析耗时汇总")
+    print("=" * 60)
+    for factor_name, minutes in factor_timing.items():
+        print(f"  {factor_name}: {minutes}分钟")
+    print(f"\n总耗时: {total_hours}小时{total_minutes}分钟" if total_hours > 0 else f"\n总耗时: {total_minutes}分钟")
+
+    # 将耗时信息存储到结果中，供后续导出Excel使用
+    all_results['_factor_timing'] = factor_timing
 
     return all_results
 
@@ -1683,6 +1924,16 @@ def analyze_single_factor(factor_name, data: DataContainer, windows=LOOKBACK_WIN
             # 如果 DataContainer 指定了最早持仓日期，取两者中较晚的
             if first_holding_date is not None:
                 first_holding_ts = pd.Timestamp(first_holding_date)
+
+                # 将 first_holding_date 转换为实际的月末交易日（小于等于该日期的最近月末）
+                if monthly_rebalance:
+                    all_dates = data.prices_df.index
+                    monthly_dates = get_monthly_rebalance_dates(all_dates)
+                    # 找到小于等于 first_holding_ts 的最近月末交易日
+                    valid_monthly_dates = monthly_dates[monthly_dates <= first_holding_ts]
+                    if len(valid_monthly_dates) > 0:
+                        first_holding_ts = valid_monthly_dates[-1]
+
                 if first_holding_ts > warmup_start_date:
                     factor_unified_start_date = first_holding_ts
                     print(f"  使用指定的最早持仓日: {factor_unified_start_date.strftime('%Y-%m-%d')}")
@@ -1822,30 +2073,34 @@ def create_best_windows_summary(all_results, top_n=1):
 def create_factor_summary_df(factor_name, factor_results, windows=LOOKBACK_WINDOWS):
     """
     创建单个因子的汇总DataFrame
-    
+
     格式：
     - 列名为窗口周期（20, 60, 120, 240）
     - 行名为指标名称
     - G5放在最前面，然后是G4, G3, G2, G1
     - IC和ICIR保留4位小数，其他指标保留2位小数
-    
+
     返回:
     pd.DataFrame: 汇总表格（行为指标，列为窗口）
     """
     # 构建数据字典：{窗口: {指标: 值}}
     data_dict = {}
-    
+
     for window in windows:
         result = factor_results.get(window)
         if result is None:
             continue
-        
+
         window_data = {}
-        # IC和ICIR保留4位小数
+        # Pearson IC 和 ICIR 保留4位小数
         window_data['IC均值'] = round(result['ic_mean'], 4) if not np.isnan(result['ic_mean']) else np.nan
         window_data['ICIR'] = round(result['icir'], 4) if not np.isnan(result['icir']) else np.nan
+        # Rank IC 和 RankICIR 保留4位小数
+        window_data['RankIC均值'] = round(result['rank_ic_mean'], 4) if not np.isnan(result['rank_ic_mean']) else np.nan
+        window_data['RankICIR'] = round(result['rank_icir'], 4) if not np.isnan(result['rank_icir']) else np.nan
+        # IC胜率
         window_data['IC胜率'] = round(result['ic_win_rate'], 4) if not np.isnan(result['ic_win_rate']) else np.nan
-        
+
         # 按G5, G4, G3, G2, G1顺序添加各层指标
         layer_order = ['G5', 'G4', 'G3', 'G2', 'G1']
         for layer_name in layer_order:
@@ -1854,15 +2109,15 @@ def create_factor_summary_df(factor_name, factor_results, windows=LOOKBACK_WINDO
                 for metric_name, value in metrics.items():
                     row_name = f'{layer_name}_{metric_name}'
                     window_data[row_name] = round(value, 2)
-        
+
         data_dict[window] = window_data
-    
+
     # 转换为DataFrame并转置（行为指标，列为窗口）
     df = pd.DataFrame(data_dict)
-    
+
     # 确保列按窗口顺序排列
     df = df.reindex(columns=windows)
-    
+
     return df
 
 
@@ -1959,56 +2214,72 @@ def create_g5_holdings_df(factor_results, windows=LOOKBACK_WINDOWS):
 
 def create_ic_cumsum_df(factor_results, windows=LOOKBACK_WINDOWS):
     """
-    创建IC累积序列DataFrame
+    创建IC累积序列DataFrame（包含 Pearson IC 和 Rank IC）
 
     参数:
     factor_results: dict, 因子分析结果 {window: result}
     windows: list, 窗口列表
 
     返回:
-    pd.DataFrame: IC累积序列（行为日期，列为窗口）
+    tuple: (pearson_ic_cumsum_df, rank_ic_cumsum_df) 两个IC累积序列DataFrame
     """
-    ic_cumsum_dict = {}
+    pearson_ic_cumsum_dict = {}
+    rank_ic_cumsum_dict = {}
     all_dates = set()
 
     for window in windows:
         result = factor_results.get(window)
-        if result is None or result.get('ic_cumsum') is None:
+        if result is None:
             continue
 
-        ic_cumsum = result['ic_cumsum']
-        ic_cumsum_dict[window] = ic_cumsum
-        all_dates.update(ic_cumsum.index)
+        # Pearson IC 累积序列
+        if result.get('ic_cumsum') is not None:
+            pearson_ic_cumsum_dict[window] = result['ic_cumsum']
+            all_dates.update(result['ic_cumsum'].index)
+
+        # Rank IC 累积序列
+        if result.get('rank_ic_cumsum') is not None:
+            rank_ic_cumsum_dict[window] = result['rank_ic_cumsum']
+            all_dates.update(result['rank_ic_cumsum'].index)
 
     if not all_dates:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     # 按日期升序排列
     sorted_dates = sorted(all_dates)
 
-    # 构建DataFrame
-    data = {}
+    # 构建 Pearson IC DataFrame
+    pearson_data = {}
     for window in windows:
-        if window in ic_cumsum_dict:
-            ic_series = ic_cumsum_dict[window]
-            # 使用 .loc 或 .get 来获取值，处理 pd.Series
-            data[f'{window}日'] = [ic_series.loc[date] if date in ic_series.index else np.nan for date in sorted_dates]
+        if window in pearson_ic_cumsum_dict:
+            ic_series = pearson_ic_cumsum_dict[window]
+            pearson_data[f'{window}日'] = [ic_series.loc[date] if date in ic_series.index else np.nan for date in sorted_dates]
         else:
-            data[f'{window}日'] = [np.nan] * len(sorted_dates)
+            pearson_data[f'{window}日'] = [np.nan] * len(sorted_dates)
+
+    # 构建 Rank IC DataFrame
+    rank_data = {}
+    for window in windows:
+        if window in rank_ic_cumsum_dict:
+            ic_series = rank_ic_cumsum_dict[window]
+            rank_data[f'{window}日'] = [ic_series.loc[date] if date in ic_series.index else np.nan for date in sorted_dates]
+        else:
+            rank_data[f'{window}日'] = [np.nan] * len(sorted_dates)
 
     # 格式化日期索引（只保留日期部分）
     formatted_dates = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in sorted_dates]
 
-    df = pd.DataFrame(data, index=formatted_dates)
-    df.index.name = '日期'
+    pearson_df = pd.DataFrame(pearson_data, index=formatted_dates)
+    pearson_df.index.name = '日期'
+    pearson_df = pearson_df.round(4)
+    pearson_df = pearson_df.dropna()
 
-    # 保留四位小数
-    df = df.round(4)
+    rank_df = pd.DataFrame(rank_data, index=formatted_dates)
+    rank_df.index.name = '日期'
+    rank_df = rank_df.round(4)
+    rank_df = rank_df.dropna()
 
-    # 删除含有空值的行，只保留所有窗口都有值的行
-    df = df.dropna()
-
-    return df
+    return pearson_df, rank_df
 
 
 def create_layer_nav_df(factor_results, windows=LOOKBACK_WINDOWS):
@@ -2118,11 +2389,9 @@ def create_best_factors_summary_df(all_results):
     all_data = {}
 
     for factor_name, factor_results in all_results.items():
-        # 获取最优窗口
+        # 获取最优窗口（只使用IC最优）
         best_info = find_best_windows(factor_results, top_n=1)
-        best_combined_windows = best_info['best_combined_windows']
         best_ic_windows = [w for w, _ in best_info['best_ic_windows']]
-        best_icir_windows = [w for w, _ in best_info['best_icir_windows']]
 
         # 获取因子描述作为列名前缀
         if factor_name in FACTOR_CONFIG:
@@ -2130,26 +2399,23 @@ def create_best_factors_summary_df(all_results):
         else:
             factor_desc = factor_name
 
-        for window in best_combined_windows:
+        # 只使用IC最优窗口
+        for window in best_ic_windows:
             result = factor_results.get(window)
             if result is None:
                 continue
 
-            # 判断是IC最优还是ICIR最优
-            labels = []
-            if window in best_ic_windows:
-                labels.append('IC最优')
-            if window in best_icir_windows:
-                labels.append('ICIR最优')
-            label_str = ' '.join(labels) if labels else '最优'
-
-            # 列名：因子描述 + 窗口 + 最优标签
-            col_name = f"{factor_desc}_{window}日({label_str})"
+            # 列名：因子描述 + 窗口
+            col_name = f"{factor_desc}_{window}日"
 
             col_data = {}
-            # IC和ICIR
+            # Pearson IC 和 ICIR
             col_data['IC均值'] = round(result['ic_mean'], 4) if not np.isnan(result['ic_mean']) else np.nan
             col_data['ICIR'] = round(result['icir'], 4) if not np.isnan(result['icir']) else np.nan
+            # Rank IC 和 RankICIR
+            col_data['RankIC均值'] = round(result['rank_ic_mean'], 4) if not np.isnan(result['rank_ic_mean']) else np.nan
+            col_data['RankICIR'] = round(result['rank_icir'], 4) if not np.isnan(result['rank_icir']) else np.nan
+            # IC胜率
             col_data['IC胜率'] = round(result['ic_win_rate'], 4) if not np.isnan(result['ic_win_rate']) else np.nan
 
             # 只输出G5的指标
@@ -2188,12 +2454,16 @@ def collect_best_factor_data(all_results):
     factor_info = {}
 
     for factor_name, factor_results in all_results.items():
-        # 找到该因子的最优窗口（按ICIR）
-        best_info = find_best_windows(factor_results, top_n=1)
-        if not best_info['best_icir_windows']:
+        # 跳过内部键（如 _factor_timing）
+        if factor_name.startswith('_'):
             continue
 
-        best_window, best_icir = best_info['best_icir_windows'][0]
+        # 找到该因子的最优窗口（按IC均值）
+        best_info = find_best_windows(factor_results, top_n=1)
+        if not best_info['best_ic_windows']:
+            continue
+
+        best_window, best_ic = best_info['best_ic_windows'][0]
         result = factor_results.get(best_window)
 
         if result is None:
@@ -2219,6 +2489,7 @@ def collect_best_factor_data(all_results):
         # 记录因子信息
         factor_info[short_name] = {
             'factor_name': factor_name,
+            'description': config.get('description', factor_name),  # 完整描述用于显示
             'window': best_window,
             'ic_mean': result.get('ic_mean', np.nan),
             'icir': result.get('icir', np.nan),
@@ -2339,10 +2610,10 @@ def create_correlation_interpretation_df(corr_matrix, corr_type='return', factor
             col1, col2 = columns[i], columns[j]
             r = corr_matrix.loc[col1, col2]
 
-            # 获取因子全名
+            # 获取因子全名（使用description）
             if factor_info:
-                full_name1 = factor_info.get(col1, {}).get('factor_name', col1)
-                full_name2 = factor_info.get(col2, {}).get('factor_name', col2)
+                full_name1 = factor_info.get(col1, {}).get('description', col1)
+                full_name2 = factor_info.get(col2, {}).get('description', col2)
             else:
                 full_name1, full_name2 = col1, col2
 
@@ -2415,9 +2686,9 @@ def create_factor_correlation_summary_df(corr_matrix, factor_info=None):
 
             r = corr_matrix.loc[factor, other_factor]
 
-            # 获取另一个因子的全名
+            # 获取另一个因子的全名（使用description）
             if factor_info:
-                other_full_name = factor_info.get(other_factor, {}).get('factor_name', other_factor)
+                other_full_name = factor_info.get(other_factor, {}).get('description', other_factor)
             else:
                 other_full_name = other_factor
 
@@ -2442,9 +2713,9 @@ def create_factor_correlation_summary_df(corr_matrix, factor_info=None):
         medium_str = '\n'.join([x[1] for x in medium_corr]) if medium_corr else ''
         low_str = '\n'.join([x[1] for x in low_corr]) if low_corr else ''
 
-        # 获取当前因子的全名
+        # 获取当前因子的全名（使用description）
         if factor_info:
-            factor_full_name = factor_info.get(factor, {}).get('factor_name', factor)
+            factor_full_name = factor_info.get(factor, {}).get('description', factor)
         else:
             factor_full_name = factor
 
@@ -2459,6 +2730,202 @@ def create_factor_correlation_summary_df(corr_matrix, factor_info=None):
     df.index.name = '因子'
 
     return df
+
+
+def generate_factor_synthesis_recommendation(ic_corr, factor_info, corr_threshold=0.6):
+    """
+    生成因子合成与保留建议
+
+    使用层次聚类识别高相关因子组，并基于ICIR给出合成建议
+
+    参数:
+        ic_corr: pd.DataFrame, IC相关性矩阵
+        factor_info: dict, 因子信息（包含ICIR等）
+        corr_threshold: float, 高相关阈值，默认0.6
+
+    返回:
+        dict: 包含聚类结果和建议
+    """
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
+
+    if ic_corr.empty or len(ic_corr) < 2:
+        return None
+
+    factors = ic_corr.columns.tolist()
+    n_factors = len(factors)
+
+    # 将相关性转换为距离矩阵 (1 - corr)
+    # 相关性越高，距离越近
+    dist_matrix = 1 - ic_corr.values
+    np.fill_diagonal(dist_matrix, 0)  # 对角线设为0
+
+    # 确保距离矩阵对称且非负
+    dist_matrix = (dist_matrix + dist_matrix.T) / 2
+    dist_matrix = np.maximum(dist_matrix, 0)
+
+    # 转换为压缩距离矩阵
+    condensed_dist = squareform(dist_matrix)
+
+    # 层次聚类
+    linkage_matrix = linkage(condensed_dist, method='average')
+
+    # 根据阈值切割聚类树 (距离阈值 = 1 - corr_threshold)
+    dist_threshold = 1 - corr_threshold
+    clusters = fcluster(linkage_matrix, t=dist_threshold, criterion='distance')
+
+    # 整理聚类结果
+    cluster_groups = {}
+    for factor, cluster_id in zip(factors, clusters):
+        if cluster_id not in cluster_groups:
+            cluster_groups[cluster_id] = []
+        cluster_groups[cluster_id].append(factor)
+
+    # 为每个聚类组生成建议
+    recommendations = []
+    independent_factors = []  # 独立因子（单独成组）
+    synthesis_groups = []     # 需要合成的组
+
+    for cluster_id, group_factors in cluster_groups.items():
+        if len(group_factors) == 1:
+            # 单独成组，独立保留
+            factor = group_factors[0]
+            info = factor_info.get(factor, {})
+            independent_factors.append({
+                'factor': factor,
+                'description': info.get('description', factor),
+                'icir': info.get('icir', 0),
+                'reason': '与其他因子相关性低，Alpha来源独立'
+            })
+        else:
+            # 多因子成组，需要合成
+            group_info = []
+            for factor in group_factors:
+                info = factor_info.get(factor, {})
+                group_info.append({
+                    'factor': factor,
+                    'description': info.get('description', factor),
+                    'icir': info.get('icir', 0),
+                })
+
+            # 按ICIR排序，选出最优因子
+            group_info.sort(key=lambda x: x['icir'], reverse=True)
+            best_factor = group_info[0]
+            other_factors = group_info[1:]
+
+            # 计算每个因子与组内其他因子的平均相关性
+            factor_avg_corrs = {}
+            for f1 in group_factors:
+                corrs_with_others = []
+                for f2 in group_factors:
+                    if f1 != f2:
+                        corrs_with_others.append(ic_corr.loc[f1, f2])
+                factor_avg_corrs[f1] = np.mean(corrs_with_others) if corrs_with_others else 0
+
+            # 计算组内所有因子对的平均相关性
+            all_pair_corrs = []
+            for i, f1 in enumerate(group_factors):
+                for f2 in group_factors[i+1:]:
+                    all_pair_corrs.append(ic_corr.loc[f1, f2])
+            group_avg_corr = np.mean(all_pair_corrs) if all_pair_corrs else 0
+
+            synthesis_groups.append({
+                'group_id': cluster_id,
+                'factors': group_factors,
+                'factor_details': group_info,
+                'best_factor': best_factor,
+                'other_factors': other_factors,
+                'factor_avg_corrs': factor_avg_corrs,  # 每个因子与组内其他因子的平均相关性
+                'avg_correlation': group_avg_corr,  # 组内平均相关性
+                'recommendation': f"建议保留 {best_factor['factor']}（ICIR最高: {best_factor['icir']:.3f}），"
+                                  f"或将组内{len(group_factors)}个因子等权/ICIR加权合成"
+            })
+
+    # 生成汇总建议DataFrame
+    summary_rows = []
+
+    # 1. 需要合成的组
+    for group in synthesis_groups:
+        for i, detail in enumerate(group['factor_details']):
+            factor_name = detail['factor']
+            row = {
+                '分组': f"合成组{group['group_id']}",
+                '因子简称': factor_name,
+                '因子全名': detail['description'],
+                'ICIR': detail['icir'],
+                '组内排名': i + 1,
+                '与组内其他因子平均相关性': group['factor_avg_corrs'].get(factor_name, 0),
+                '建议': '★ 推荐保留' if i == 0 else '可合成或剔除',
+            }
+            summary_rows.append(row)
+
+    # 2. 独立因子
+    for factor_data in independent_factors:
+        row = {
+            '分组': '独立因子',
+            '因子简称': factor_data['factor'],
+            '因子全名': factor_data['description'],
+            'ICIR': factor_data['icir'],
+            '组内排名': 1,
+            '与组内其他因子平均相关性': 0,
+            '建议': '★ 独立保留',
+        }
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # 生成最终建议文本
+    final_recommendations = []
+    final_recommendations.append("=" * 60)
+    final_recommendations.append("【因子合成与保留建议】")
+    final_recommendations.append("=" * 60)
+    final_recommendations.append(f"\n分析基于IC序列相关性，阈值: {corr_threshold}")
+    final_recommendations.append(f"共 {n_factors} 个因子，分为 {len(cluster_groups)} 组\n")
+
+    # 合成组建议
+    if synthesis_groups:
+        final_recommendations.append("-" * 40)
+        final_recommendations.append("【需要合成/精简的因子组】")
+        final_recommendations.append("-" * 40)
+        for group in synthesis_groups:
+            final_recommendations.append(f"\n◆ 合成组{group['group_id']}（{len(group['factors'])}个因子，平均相关性: {group['avg_correlation']:.3f}）")
+            for i, detail in enumerate(group['factor_details']):
+                marker = "★" if i == 0 else "  "
+                final_recommendations.append(f"  {marker} {detail['factor']}: ICIR={detail['icir']:.3f}")
+            final_recommendations.append(f"  → {group['recommendation']}")
+
+    # 独立因子
+    if independent_factors:
+        final_recommendations.append("\n" + "-" * 40)
+        final_recommendations.append("【独立保留的因子】（与其他因子相关性低）")
+        final_recommendations.append("-" * 40)
+        for factor_data in sorted(independent_factors, key=lambda x: x['icir'], reverse=True):
+            final_recommendations.append(f"  ★ {factor_data['factor']}: ICIR={factor_data['icir']:.3f}")
+
+    # 最终精简建议
+    final_recommendations.append("\n" + "=" * 60)
+    final_recommendations.append("【最终精简建议】")
+    final_recommendations.append("=" * 60)
+
+    recommended_factors = []
+    for group in synthesis_groups:
+        recommended_factors.append(group['best_factor']['factor'])
+    for factor_data in independent_factors:
+        recommended_factors.append(factor_data['factor'])
+
+    final_recommendations.append(f"\n从 {n_factors} 个因子精简为 {len(recommended_factors)} 个:")
+    for f in recommended_factors:
+        info = factor_info.get(f, {})
+        final_recommendations.append(f"  • {f} ({info.get('description', f)})")
+
+    return {
+        'cluster_groups': cluster_groups,
+        'synthesis_groups': synthesis_groups,
+        'independent_factors': independent_factors,
+        'summary_df': summary_df,
+        'recommended_factors': recommended_factors,
+        'recommendation_text': '\n'.join(final_recommendations),
+    }
 
 
 def analyze_multi_factor_correlation(all_results):
@@ -2507,6 +2974,13 @@ def analyze_multi_factor_correlation(all_results):
     # 生成因子角度的汇总表（基于IC相关性）
     factor_summary_df = create_factor_correlation_summary_df(ic_corr, factor_info)
 
+    # 生成因子合成与保留建议
+    print("\n生成因子合成与保留建议...")
+    synthesis_recommendation = generate_factor_synthesis_recommendation(ic_corr, factor_info)
+
+    if synthesis_recommendation:
+        print(synthesis_recommendation['recommendation_text'])
+
     return {
         'factor_info': factor_info,
         'ic_df': ic_df,
@@ -2517,6 +2991,7 @@ def analyze_multi_factor_correlation(all_results):
         'ic_corr': ic_corr,
         'ic_interpretation': ic_interp,
         'factor_summary': factor_summary_df,
+        'synthesis_recommendation': synthesis_recommendation,
     }
 
 
@@ -2552,7 +3027,7 @@ def _export_correlation_sheet(writer, correlation_results):
         for name, info in factor_info.items():
             info_rows.append({
                 '因子简称': name,
-                '因子全名': info.get('factor_name', ''),
+                '因子全名': info.get('description', ''),
                 '最优窗口': f"{info.get('window', '')}日",
                 'IC均值': round(info.get('ic_mean', 0), 4),
                 'ICIR': round(info.get('icir', 0), 4),
@@ -2610,6 +3085,40 @@ def _export_correlation_sheet(writer, correlation_results):
         factor_summary.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
         start_row += len(factor_summary) + 3
 
+    # 8. 写入因子合成与保留建议
+    synthesis_rec = correlation_results.get('synthesis_recommendation')
+    if synthesis_rec is not None:
+        # 8.1 写入汇总表
+        summary_df = synthesis_rec.get('summary_df')
+        if summary_df is not None and not summary_df.empty:
+            header_df = pd.DataFrame({'【因子合成与保留建议】（基于层次聚类，相关性阈值0.6）': ['']})
+            header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+            start_row += 1
+            summary_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+            start_row += len(summary_df) + 3
+
+        # 8.2 写入推荐保留的因子列表
+        recommended = synthesis_rec.get('recommended_factors', [])
+        if recommended:
+            rec_rows = []
+            factor_info = correlation_results.get('factor_info', {})
+            for f in recommended:
+                info = factor_info.get(f, {})
+                rec_rows.append({
+                    '推荐保留因子': f,
+                    '因子全名': info.get('description', f),
+                    'ICIR': round(info.get('icir', 0), 4),
+                })
+            rec_df = pd.DataFrame(rec_rows)
+
+            n_original = len(factor_info)
+            n_recommended = len(recommended)
+            header_df = pd.DataFrame({f'【最终精简建议】从{n_original}个因子精简为{n_recommended}个': ['']})
+            header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+            start_row += 1
+            rec_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
+            start_row += len(rec_df) + 3
+
 
 def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', windows=LOOKBACK_WINDOWS, correlation_results=None):
     """
@@ -2622,6 +3131,9 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
     windows: list, 窗口列表
     correlation_results: dict, 多因子相关性分析结果（可选）
     """
+    # 提取耗时信息（如果有）
+    factor_timing = all_results.pop('_factor_timing', {})
+
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         # 创建所有因子最优窗口汇总（作为第一个sheet）
         if len(all_results) >= 1:
@@ -2656,8 +3168,8 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
             # 创建G5持仓记录（按列输出每个窗口）
             g5_holdings_df = create_g5_holdings_df(factor_results, factor_windows)
 
-            # 创建IC累积序列
-            ic_cumsum_df = create_ic_cumsum_df(factor_results, factor_windows)
+            # 创建IC累积序列（Pearson IC 和 Rank IC）
+            pearson_ic_cumsum_df, rank_ic_cumsum_df = create_ic_cumsum_df(factor_results, factor_windows)
 
             # 创建分层累积净值
             layer_nav_dict = create_layer_nav_df(factor_results, factor_windows)
@@ -2685,14 +3197,10 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
             else:
                 start_row += 1
 
-            # 写入最优窗口信息
+            # 写入最优窗口信息（只显示IC最优）
             best_ic_str = ', '.join([f"{w}日(IC={v:.4f})" for w, v in best_info['best_ic_windows']])
-            best_icir_str = ', '.join([f"{w}日(ICIR={v:.4f})" for w, v in best_info['best_icir_windows']])
-            best_combined_str = ', '.join([f"{w}日" for w in best_info['best_combined_windows']])
             best_windows_info = pd.DataFrame({
-                '【最优窗口】': [f'最优IC窗口: {best_ic_str}'],
-                '': [f'最优ICIR窗口: {best_icir_str}'],
-                ' ': [f'综合最优窗口: {best_combined_str}']
+                '【最优窗口】': [f'IC最优窗口: {best_ic_str}'],
             })
             best_windows_info.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
             start_row += 3
@@ -2706,71 +3214,274 @@ def export_to_excel(all_results, output_file='factors_analysis_report.xlsx', win
                 summary_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
                 start_row += len(summary_df) + 3
 
-            # 只对最优窗口输出详细的G5每年收益统计
+            # 只对IC最优窗口输出详细的G5每年收益统计
             best_ic_windows = [w for w, _ in best_info['best_ic_windows']]
-            best_icir_windows = [w for w, _ in best_info['best_icir_windows']]
-            best_combined_windows = best_info['best_combined_windows']
 
-            for window in best_combined_windows:
+            for window in best_ic_windows:
                 if window in g5_yearly_dict:
                     yearly_df = g5_yearly_dict[window]
-                    # 判断是IC最优还是ICIR最优
-                    labels = []
-                    if window in best_ic_windows:
-                        labels.append('IC最优')
-                    if window in best_icir_windows:
-                        labels.append('ICIR最优')
-                    label_str = ' '.join(labels) if labels else '最优'
-                    # 写入标题行（标记为最优窗口）
-                    header_df = pd.DataFrame({f'【G5每年收益统计 - {window}日窗口 {label_str}】': ['']})
+                    # 写入标题行
+                    header_df = pd.DataFrame({f'【G5每年收益统计 - {window}日窗口】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
                     yearly_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += len(yearly_df) + 3
 
-            # 只对最优窗口输出IC累积序列
-            if not ic_cumsum_df.empty and best_combined_windows:
-                # IC累积序列的列名格式是 '20日', '60日' 等
-                best_ic_cols = [f'{w}日' for w in best_combined_windows if f'{w}日' in ic_cumsum_df.columns]
-                if best_ic_cols:
-                    ic_cumsum_best_df = ic_cumsum_df[best_ic_cols]
-                    # 写入标题行
-                    header_df = pd.DataFrame({f'【IC累积序列 - 最优窗口】': ['']})
+            # 只对IC最优窗口输出IC累积序列（合并Pearson IC和Rank IC到一个表）
+            ic_chart_info = None  # 记录IC累积序列的位置信息，用于生成图表
+            if best_ic_windows:
+                best_ic_cols = [f'{w}日' for w in best_ic_windows]
+
+                # 合并IC和RankIC到一个DataFrame
+                combined_ic_data = {}
+                has_data = False
+
+                for w in best_ic_windows:
+                    col_name = f'{w}日'
+                    # 添加Pearson IC列
+                    if not pearson_ic_cumsum_df.empty and col_name in pearson_ic_cumsum_df.columns:
+                        combined_ic_data[f'IC_{w}日'] = pearson_ic_cumsum_df[col_name]
+                        has_data = True
+                    # 添加Rank IC列
+                    if not rank_ic_cumsum_df.empty and col_name in rank_ic_cumsum_df.columns:
+                        combined_ic_data[f'RankIC_{w}日'] = rank_ic_cumsum_df[col_name]
+                        has_data = True
+
+                if has_data:
+                    combined_ic_df = pd.DataFrame(combined_ic_data)
+                    # 按列名排序：IC_20日, RankIC_20日, IC_60日, RankIC_60日, ...
+                    sorted_cols = []
+                    for w in best_ic_windows:
+                        if f'IC_{w}日' in combined_ic_df.columns:
+                            sorted_cols.append(f'IC_{w}日')
+                        if f'RankIC_{w}日' in combined_ic_df.columns:
+                            sorted_cols.append(f'RankIC_{w}日')
+                    combined_ic_df = combined_ic_df[sorted_cols]
+
+                    header_df = pd.DataFrame({'【IC/RankIC累积序列 - IC最优窗口】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
-                    ic_cumsum_best_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
-                    start_row += len(ic_cumsum_best_df) + 3
+                    ic_data_start_row = start_row  # 记录数据起始行
+                    combined_ic_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
+                    ic_chart_info = {
+                        'start_row': ic_data_start_row,
+                        'end_row': start_row + len(combined_ic_df),
+                        'num_cols': len(sorted_cols) + 1,  # +1 for index column
+                        'label': 'IC'
+                    }
+                    start_row += len(combined_ic_df) + 3
 
-            # 只对最优窗口输出分层累积净值
-            for window in best_combined_windows:
+            # 只对IC最优窗口输出分层累积净值
+            nav_chart_info = None  # 记录分层净值的位置信息，用于生成图表
+            for window in best_ic_windows:
                 if window in layer_nav_dict:
                     nav_df = layer_nav_dict[window]
-                    # 判断是IC最优还是ICIR最优
-                    labels = []
-                    if window in best_ic_windows:
-                        labels.append('IC最优')
-                    if window in best_icir_windows:
-                        labels.append('ICIR最优')
-                    label_str = ' '.join(labels) if labels else '最优'
-                    # 写入标题行（标记为最优窗口）
-                    header_df = pd.DataFrame({f'【分层累积净值 - {window}日窗口 {label_str}】': ['']})
+                    # 写入标题行
+                    header_df = pd.DataFrame({f'【分层累积净值 - {window}日窗口】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
+                    nav_data_start_row = start_row  # 记录数据起始行
                     nav_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
+                    # 只记录第一个窗口的图表信息
+                    if nav_chart_info is None:
+                        nav_chart_info = {
+                            'start_row': nav_data_start_row,
+                            'end_row': start_row + len(nav_df),
+                            'num_cols': len(nav_df.columns) + 1,  # +1 for index column
+                            'window': window
+                        }
                     start_row += len(nav_df) + 3
 
-            # 只对最优窗口输出G5持仓记录
-            if not g5_holdings_df.empty and best_combined_windows:
+            # 只对IC最优窗口输出G5持仓记录
+            if not g5_holdings_df.empty and best_ic_windows:
                 # G5持仓记录的列名是整数（20, 60, 120, 240）
-                best_cols = [w for w in best_combined_windows if w in g5_holdings_df.columns]
+                best_cols = [w for w in best_ic_windows if w in g5_holdings_df.columns]
                 if best_cols:
                     g5_holdings_best_df = g5_holdings_df[best_cols]
                     # 写入标题行
-                    header_df = pd.DataFrame({f'【G5持仓行业 - 最优窗口】': ['']})
+                    header_df = pd.DataFrame({f'【G5持仓行业 - IC最优窗口】': ['']})
                     header_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False)
                     start_row += 1
                     g5_holdings_best_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
                     start_row += len(g5_holdings_best_df) + 3
+
+            # 生成图表（在所有数据写入后）
+            # 获取工作表对象
+            ws = writer.sheets[sheet_name]
+
+            # 导入图表样式相关模块
+            from openpyxl.chart.axis import ChartLines
+            from openpyxl.drawing.line import LineProperties
+
+            # 创建虚线网格线样式
+            def create_dashed_gridlines():
+                """创建虚线网格线"""
+                gridlines = ChartLines()
+                gridlines.spPr = GraphicalProperties(ln=LineProperties(prstDash='dash'))
+                return gridlines
+
+            # 1. 生成IC累积曲线图（同时显示IC和RankIC）
+            if ic_chart_info is not None:
+                from openpyxl.chart.legend import Legend
+                from openpyxl.chart.layout import Layout, ManualLayout
+                from openpyxl.drawing.line import LineProperties as DrawingLineProperties
+
+                ic_chart = LineChart()
+                ic_chart.title = "IC/RankIC累积曲线"
+                ic_chart.style = 2  # 使用简洁样式，避免分段变色
+                ic_chart.y_axis.title = "累积值"
+                ic_chart.x_axis.title = "日期"
+                ic_chart.width = 10
+                ic_chart.height = 6
+
+                # 设置网格线为虚线，减少网格线数量
+                ic_chart.y_axis.majorGridlines = create_dashed_gridlines()
+                ic_chart.x_axis.majorGridlines = None  # 不显示X轴网格线
+
+                # 减少Y轴网格线数量
+                ic_chart.y_axis.majorUnit = None  # 让Excel自动计算合适的间隔
+
+                # 显示轴刻度标签
+                ic_chart.x_axis.tickLblPos = "low"
+                ic_chart.y_axis.tickLblPos = "low"
+                ic_chart.x_axis.delete = False
+                ic_chart.y_axis.delete = False
+
+                # 设置X轴标签间隔（每隔一定数量显示一个标签）
+                data_rows = ic_chart_info['end_row'] - ic_chart_info['start_row']
+                ic_chart.x_axis.tickLblSkip = max(1, data_rows // 8)
+                ic_chart.x_axis.tickMarkSkip = max(1, data_rows // 8)
+
+                # 数据范围（从第2列开始，跳过日期列）
+                data_ref = Reference(ws,
+                                    min_col=2,
+                                    min_row=ic_chart_info['start_row'] + 1,  # +1 因为Excel行号从1开始
+                                    max_col=ic_chart_info['num_cols'],
+                                    max_row=ic_chart_info['end_row'] + 1)
+                # 日期作为X轴
+                cats_ref = Reference(ws,
+                                    min_col=1,
+                                    min_row=ic_chart_info['start_row'] + 2,  # 跳过标题行
+                                    max_row=ic_chart_info['end_row'] + 1)
+
+                ic_chart.add_data(data_ref, titles_from_data=True)
+                ic_chart.set_categories(cats_ref)
+
+                # 设置线条颜色：IC黑色(000000)，RankIC蓝色(0000FF)
+                for i, series in enumerate(ic_chart.series):
+                    if i == 0:  # IC - 黑色
+                        series.graphicalProperties.line.solidFill = "000000"
+                    elif i == 1:  # RankIC - 蓝色
+                        series.graphicalProperties.line.solidFill = "0000FF"
+
+                # 设置图例在左上角（使用手动布局）
+                ic_chart.legend = Legend()
+                ic_chart.legend.layout = Layout(
+                    manualLayout=ManualLayout(
+                        xMode='edge',
+                        yMode='edge',
+                        x=0.02,  # 距左边2%
+                        y=0.02,  # 距顶部2%
+                    )
+                )
+
+                # 将图表添加到工作表（放在H5）
+                ws.add_chart(ic_chart, "H5")
+
+            # 2. 生成分层净值曲线图
+            if nav_chart_info is not None:
+                from openpyxl.chart.legend import Legend
+                from openpyxl.chart.layout import Layout, ManualLayout
+
+                nav_chart = LineChart()
+                nav_chart.title = f"分层累积净值曲线 - {nav_chart_info['window']}日窗口"
+                nav_chart.style = 2  # 使用简洁样式，避免分段变色
+                nav_chart.y_axis.title = "净值"
+                nav_chart.x_axis.title = "日期"
+                nav_chart.width = 18
+                nav_chart.height = 10
+
+                # 设置网格线为虚线，减少网格线数量
+                nav_chart.y_axis.majorGridlines = create_dashed_gridlines()
+                nav_chart.x_axis.majorGridlines = None  # 不显示X轴网格线
+
+                # 显示轴刻度标签
+                nav_chart.x_axis.tickLblPos = "low"
+                nav_chart.y_axis.tickLblPos = "low"
+                nav_chart.x_axis.delete = False
+                nav_chart.y_axis.delete = False
+
+                # 设置X轴标签间隔
+                data_rows = nav_chart_info['end_row'] - nav_chart_info['start_row']
+                nav_chart.x_axis.tickLblSkip = max(1, data_rows // 8)
+                nav_chart.x_axis.tickMarkSkip = max(1, data_rows // 8)
+
+                # 数据范围（从第2列开始，跳过日期列）
+                # 数据列顺序是 G1, G2, G3, G4, G5, 基准
+                # 需要按 G5, G4, G3, G2, G1, 基准 的顺序添加
+                num_cols = nav_chart_info['num_cols']
+
+                # 日期作为X轴
+                cats_ref = Reference(ws,
+                                    min_col=1,
+                                    min_row=nav_chart_info['start_row'] + 2,
+                                    max_row=nav_chart_info['end_row'] + 1)
+
+                # 按 G5, G4, G3, G2, G1, 基准 顺序添加数据系列
+                # 原始列顺序: 2=G1, 3=G2, 4=G3, 5=G4, 6=G5, 7=基准
+                # 目标顺序: G5(6), G4(5), G3(4), G2(3), G1(2), 基准(7)
+                col_order = [6, 5, 4, 3, 2, 7]  # G5, G4, G3, G2, G1, 基准
+
+                for col_idx in col_order:
+                    if col_idx <= num_cols:
+                        data_ref = Reference(ws,
+                                            min_col=col_idx,
+                                            min_row=nav_chart_info['start_row'] + 1,
+                                            max_row=nav_chart_info['end_row'] + 1)
+                        nav_chart.add_data(data_ref, titles_from_data=True)
+
+                nav_chart.set_categories(cats_ref)
+
+                # 设置图例位置到左上角
+                nav_chart.legend = Legend()
+                nav_chart.legend.position = 'l'  # 左侧
+                nav_chart.legend.layout = Layout(
+                    manualLayout=ManualLayout(
+                        xMode='edge',
+                        yMode='edge',
+                        x=0.08,  # 左边距（相对于绘图区）
+                        y=0.08,  # 上边距（更靠上）
+                        h=0.25,  # 高度
+                        w=0.12   # 宽度
+                    )
+                )
+
+                # 将图表添加到工作表（放在H18）
+                ws.add_chart(nav_chart, "H18")
+
+        # 在最后添加计算耗时sheet
+        if factor_timing:
+            print("正在导出计算耗时统计...")
+            timing_data = []
+            total_minutes = 0
+            for factor_name, minutes in factor_timing.items():
+                # 获取因子描述
+                if factor_name in FACTOR_CONFIG:
+                    factor_desc = FACTOR_CONFIG[factor_name].get('description', factor_name)
+                else:
+                    factor_desc = factor_name
+                timing_data.append({
+                    '因子名称': factor_desc,
+                    '计算耗时(分钟)': minutes
+                })
+                total_minutes += minutes
+            # 添加总计行
+            timing_data.append({
+                '因子名称': '【总计】',
+                '计算耗时(分钟)': total_minutes
+            })
+            timing_df = pd.DataFrame(timing_data)
+            timing_df.to_excel(writer, sheet_name='计算耗时统计', index=False)
 
     print(f"\n分析报告已导出到: {output_file}")
 
@@ -2789,6 +3500,8 @@ def format_excel_report(file_path: str):
     2. 将每个sheet页的A列宽度设置为11
     3. 隐藏每个sheet页的22行到55行（调整后的行号）
     4. 动态查找ICIR行，比较各窗口的ICIR值，将最大值所在列加粗
+    5. 在"因子最优窗口汇总"sheet中为因子名添加超链接到对应sheet
+    6. 在每个因子sheet的A2位置添加返回"因子最优窗口汇总"的链接
 
     参数:
         file_path: str, Excel文件路径
@@ -2799,13 +3512,59 @@ def format_excel_report(file_path: str):
     # 加载工作簿
     wb = load_workbook(file_path)
 
+    # 获取所有sheet名称，用于建立因子名到sheet名的映射
+    all_sheet_names = wb.sheetnames
+
+    # 处理"因子最优窗口汇总"sheet的超链接
+    summary_sheet_name = '因子最优窗口汇总'
+    if summary_sheet_name in wb.sheetnames:
+        ws_summary = wb[summary_sheet_name]
+
+        # 设置A列左对齐
+        for row in range(1, ws_summary.max_row + 1):
+            cell = ws_summary.cell(row=row, column=1)
+            cell.alignment = Alignment(horizontal='left')
+
+        # 设置第1行自动换行、顶对齐、左对齐
+        for col in range(1, ws_summary.max_column + 1):
+            cell = ws_summary.cell(row=1, column=col)
+            cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+        # 遍历第一行（标题行），从B列开始（A列是指标名）
+        for col in range(2, ws_summary.max_column + 1):
+            cell = ws_summary.cell(row=1, column=col)
+            col_name = cell.value
+
+            if col_name:
+                # 列名格式: "因子描述_窗口日(标签)"，例如 "行业间动量1-1-Lasso因子_20日(IC最优 ICIR最优)"
+                # 提取因子描述部分（最后一个下划线前的内容）
+                # 注意：因子描述本身可能包含下划线，所以用rsplit从右边分割
+                parts = col_name.rsplit('_', 1)
+                if len(parts) >= 1:
+                    factor_desc = parts[0]  # 因子描述部分
+                    # sheet名最长31字符
+                    target_sheet_name = factor_desc[:31]
+
+                    if target_sheet_name in all_sheet_names:
+                        # 添加超链接到对应的sheet
+                        cell.hyperlink = f"#'{target_sheet_name}'!A1"
+                        # 设置超链接样式（蓝色下划线，自动换行）
+                        cell.font = Font(color="0000FF", underline="single")
+
     # 遍历所有sheet页
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
 
         # 跳过汇总sheet页
-        if sheet_name == '最优窗口汇总':
+        if sheet_name == '最优窗口汇总' or sheet_name == summary_sheet_name:
             continue
+
+        # 0. 在B1位置添加返回"因子最优窗口汇总"的链接
+        if summary_sheet_name in wb.sheetnames:
+            return_cell = ws.cell(row=1, column=2)
+            return_cell.value = "← 返回汇总"
+            return_cell.hyperlink = f"#'{summary_sheet_name}'!A1"
+            return_cell.font = Font(color="0000FF", underline="single")
 
         # 1. 设置A列宽度为11
         ws.column_dimensions['A'].width = 11
@@ -2823,8 +3582,8 @@ def format_excel_report(file_path: str):
                 icir_row = row
                 break
 
-        # 4. 隐藏23行到54行（包括代码）
-        for row in range(23, 55):  # 23到54行（包含54）
+        # 4. 隐藏25行到56行
+        for row in range(25, 57):  # 25到56行（包含56）
             if row <= ws.max_row:
                 ws.row_dimensions[row].hidden = True
 
@@ -2846,7 +3605,7 @@ def format_excel_report(file_path: str):
 
                 # 将该列从汇总表标题行到隐藏区域结束的行加粗
                 summary_header_row = icir_row - 2  # 汇总表标题行
-                bold_end_row = 54  # 加粗到第54行（与隐藏区域一致）
+                bold_end_row = 56  # 加粗到第56行（与隐藏区域一致）
                 for row in range(summary_header_row, bold_end_row + 1):
                     if row <= ws.max_row:
                         cell = ws.cell(row=row, column=max_col)
@@ -2878,8 +3637,8 @@ def run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=None):
     调用 bubble/positive_bubble_factor_core.py 中的主函数
 
     参数:
-        backtest_years: int, 回测年限，默认10年
-        end_date: str, 截止日期，默认使用数据最新日期
+        backtest_years: int, 回测年限，默认10年（当前版本未使用，保留接口兼容性）
+        end_date: str, 截止日期，默认使用数据最新日期（当前版本未使用，保留接口兼容性）
 
     返回:
         dict: 回测结果
@@ -2897,11 +3656,8 @@ def run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=None):
         print("运行泡沫因子分析（周频调仓）")
         print("=" * 60)
 
-        # 调用泡沫因子主函数
-        result = bubble_main(
-            backtest_years=backtest_years,
-            end_date=end_date
-        )
+        # 调用泡沫因子主函数（泡沫因子模块内部管理数据加载和回测期限）
+        result = bubble_main()
 
         return result
 

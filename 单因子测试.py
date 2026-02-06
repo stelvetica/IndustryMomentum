@@ -8,8 +8,17 @@
 所有计算逻辑在 factors_analysis 模块中实现。
 """
 
+import importlib
+import sys
+
+# 强制重新加载关键模块，避免使用缓存的旧版本
+for module_name in ['factor_', 'factors_analysis', 'data_loader']:
+    if module_name in sys.modules:
+        importlib.reload(sys.modules[module_name])
+
 import data_loader
 import factors_analysis as fa
+import factor_  # 确保factor_模块被加载
 
 # ============================================================
 # 配置区域 - 只需修改这里
@@ -121,5 +130,7 @@ if __name__ == "__main__":
     #run_analysis('momentum_price_volume_icir', None)
     #run_analysis('momentum_amplitude_cut', '2020-06-30')
     #run_analysis('momentum_amplitude_cut', None)
-    run_analysis('momentum_volume_return_corr', None)
-    
+    #run_analysis('momentum_volume_return_corr', None)
+    #run_analysis('momentum_pure_liquidity_stripped', None)
+    run_analysis('momentum_synthesis_equal', None)
+    run_analysis('momentum_synthesis_icir', None)

@@ -6,9 +6,6 @@
 
 核心算法:
 - BSADF (Backward Sup ADF): 泡沫检测，捕捉价格/成交额的爆炸性行为
-  - 完整实现 Phillips, Shi, Yu (2015) 的 PSY 检验
-  - 支持 BIC/AIC 自动选择滞后阶数 (默认 IC=2 即 BIC, adflag=6)
-  - 动态最小窗口: swindow0 = floor(T * (0.01 + 1.8/sqrt(T)))
 - BOCD (Bayesian Online Changepoint Detection): 变点检测，捕捉趋势起点
 
 信号合成公式 (严格按照研报):
@@ -16,13 +13,12 @@
 
 模块结构:
 1. 数据加载模块
-2. ADF 检验模块 (支持滞后项 + BIC/AIC 选择)
-3. BSADF 计算模块 (PSY 检验)
-4. BOCD 计算模块 (GaussianBOCD 类)
-5. 信号计算接口
-6. 回测接口
-7. 绩效分析工具函数
-8. Excel 导出模块
+2. BSADF 计算模块 (快速 OLS + numba 加速)
+3. BOCD 计算模块 (GaussianBOCD 类)
+4. 信号计算接口
+5. 回测接口
+6. 绩效分析工具函数
+7. Excel 导出模块
 """
 
 import pandas as pd
@@ -32,6 +28,7 @@ import os
 import sys
 import time
 from scipy import stats
+from numba import jit
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -55,11 +52,11 @@ def format_time(seconds: float) -> str:
         return f"{hours}小时{mins}分"
 
 
-def print_progress(current: int, total: int, prefix: str = "", 
+def print_progress(current: int, total: int, prefix: str = "",
                    start_time: float = None, bar_length: int = 30):
     """
-    打印进度条
-    
+    打印进度条（单行刷新）
+
     参数:
         current: int, 当前进度
         total: int, 总数
@@ -70,17 +67,20 @@ def print_progress(current: int, total: int, prefix: str = "",
     percent = current / total
     filled = int(bar_length * percent)
     bar = "█" * filled + "░" * (bar_length - filled)
-    
+
     # 时间估计
     time_info = ""
     if start_time is not None and current > 0:
         elapsed = time.time() - start_time
         eta = elapsed / current * (total - current)
         time_info = f" | 已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
-    
-    sys.stdout.write(f"\r{prefix} |{bar}| {current}/{total} ({percent*100:.1f}%){time_info}")
+
+    # 使用 ANSI 转义序列清除整行并输出
+    # \033[2K 清除整行, \r 回到行首
+    msg = f"{prefix} |{bar}| {current}/{total} ({percent*100:.1f}%){time_info}"
+    sys.stdout.write('\033[2K\r' + msg)
     sys.stdout.flush()
-    
+
     if current == total:
         print()  # 换行
 
@@ -92,115 +92,20 @@ def print_progress(current: int, total: int, prefix: str = "",
 # 默认数据文件路径
 DEFAULT_CACHE_FILE = "data/sw_industry_data.pkl"
 
-# 默认输出目录 (与 factors_analysis.py 一致)
-OUTPUT_DIR = "factor分析"
-
-# 导入 factors_analysis 中的日期计算函数
-HAS_FACTORS_ANALYSIS = False
-try:
-    from factors_analysis import calculate_backtest_dates
-    HAS_FACTORS_ANALYSIS = True
-except ImportError:
-    # 尝试从父目录导入
-    try:
-        import sys
-        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if parent_dir not in sys.path:
-            sys.path.insert(0, parent_dir)
-        from factors_analysis import calculate_backtest_dates
-        HAS_FACTORS_ANALYSIS = True
-    except ImportError:
-        pass
-
-
-def _calculate_backtest_dates_simple(data_start, data_end, end_date=None, backtest_years=10, freq='W'):
-    """
-    简化版回测日期计算 (与 factors_analysis.py 逻辑一致)
-
-    逻辑：
-    1. 最晚持仓日 = 截止日期所在周期的上一个完整周期末
-    2. 最早持仓日 = 往前推 backtest_years 年的12月最后一个周五(周频)或12月31日(月频)
-
-    参数:
-        freq: str, 调仓频率，'W'=周频(默认), 'M'=月频
-    """
-    import calendar
-
-    # 确定截止日期
-    if end_date is None:
-        end_dt = data_end
-    else:
-        end_dt = pd.Timestamp(end_date)
-        if end_dt > data_end:
-            end_dt = data_end
-
-    if freq == 'W':
-        # 周频：最晚持仓日为截止日期之前的最后一个周五
-        days_since_friday = (end_dt.weekday() - 4) % 7
-        if days_since_friday == 0:
-            days_since_friday = 7  # 如果正好是周五，往前推一周
-        last_holding_date = end_dt - pd.Timedelta(days=days_since_friday)
-
-        # 最早持仓日：基于最晚持仓日的年份往前推backtest_years年
-        base_year = last_holding_date.year
-        if last_holding_date.month == 1:
-            base_year -= 1  # 如果最晚持仓日在1月，基准年份应该是上一年
-
-        first_holding_year = base_year - backtest_years
-        dec_31 = pd.Timestamp(year=first_holding_year, month=12, day=31)
-        days_to_friday = (dec_31.weekday() - 4) % 7
-        first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
-    else:
-        # 月频：最晚持仓日为截止日期所在月的上一个完整月末
-        last_holding_year = end_dt.year
-        last_holding_month = end_dt.month - 1
-        if last_holding_month == 0:
-            last_holding_month = 12
-            last_holding_year -= 1
-
-        _, last_day = calendar.monthrange(last_holding_year, last_holding_month)
-        last_holding_date = pd.Timestamp(year=last_holding_year, month=last_holding_month, day=last_day)
-
-        # 最早持仓日：往前推 backtest_years 年的12月31日
-        first_holding_year = last_holding_date.year - backtest_years
-        first_holding_date = pd.Timestamp(year=first_holding_year, month=12, day=31)
-
-    # 检查数据是否足够
-    if first_holding_date < data_start:
-        first_year = data_start.year
-        if data_start.month > 1 or (data_start.month == 1 and data_start.day > 1):
-            first_year += 1
-
-        if freq == 'W':
-            dec_31 = pd.Timestamp(year=first_year, month=12, day=31)
-            days_to_friday = (dec_31.weekday() - 4) % 7
-            first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
-        else:
-            first_holding_date = pd.Timestamp(year=first_year, month=12, day=31)
-
-    return first_holding_date, last_holding_date, str(first_holding_date.date())
-
 
 def load_data(
     file_path: str = DEFAULT_CACHE_FILE,
-    backtest_years: int = 10,
-    end_date: str = None,
-    warmup_years: int = 2,
     verbose: bool = True
 ) -> tuple:
     """
     加载行业数据 (价格和成交额)
 
-    日期逻辑 (与 factors_analysis.py 一致):
-    1. 最晚持仓日 = 数据最后完整月末
-    2. 最早持仓日 = 往前推 backtest_years 年的12月31日
-    3. 数据起始日 = 最早持仓日再往前推 warmup_years 年 (BSADF预热期)
+    数据格式: pickle 文件，包含
+    - 'data': DataFrame (列: 日期, 代码, 名称, CLOSE, HIGH, LOW, VOLUME, DQ_AMTTURNOVER)
+    - 'industry_info': DataFrame (列: 代码, 名称)
 
     参数:
         file_path: str, 数据文件路径
-        backtest_years: int, 回测年限，默认10年
-        end_date: str, 截止日期，默认使用数据最新日期
-        warmup_years: int, 预热期年数，默认2年 (BSADF需要约1-2年数据)
         verbose: bool, 是否打印加载信息
 
     返回:
@@ -232,62 +137,8 @@ def load_data(
 
     if verbose:
         n_industries = df['代码'].nunique()
-        print(f"原始数据: {n_industries} 个行业")
-        print(f"原始日期范围: {prices_df.index[0].date()} 至 {prices_df.index[-1].date()}")
-
-    # 使用 factors_analysis 的日期计算逻辑 (周频)
-    if HAS_FACTORS_ANALYSIS:
-        # calculate_backtest_dates 返回 (first_holding_date, last_holding_date, data_start_needed)
-        first_holding_date, last_holding_date, _ = calculate_backtest_dates(
-            prices_df.index[0], prices_df.index[-1],
-            end_date=end_date, backtest_years=backtest_years, freq='W'
-        )
-
-        # 转换为 Timestamp
-        first_holding_ts = pd.Timestamp(first_holding_date)
-        last_holding_ts = last_holding_date if isinstance(last_holding_date, pd.Timestamp) else pd.Timestamp(last_holding_date)
-
-        # 数据起始日 = 最早持仓日往前推 warmup_years 年 (BSADF预热期)
-        data_start = first_holding_ts - pd.DateOffset(years=warmup_years)
-
-        # 确保不早于原始数据起始日
-        if data_start < prices_df.index[0]:
-            data_start = prices_df.index[0]
-
-        # 数据截止日 = 最晚持仓日
-        data_end = last_holding_ts
-
-    else:
-        # 使用简化版本的日期计算 (与 factors_analysis.py 逻辑一致, 周频)
-        first_holding_date, last_holding_date, _ = _calculate_backtest_dates_simple(
-            prices_df.index[0], prices_df.index[-1],
-            end_date=end_date, backtest_years=backtest_years, freq='W'
-        )
-
-        first_holding_ts = first_holding_date
-        last_holding_ts = last_holding_date
-
-        # 数据起始日 = 最早持仓日往前推 warmup_years 年 (BSADF预热期)
-        data_start = first_holding_ts - pd.DateOffset(years=warmup_years)
-
-        # 确保不早于原始数据起始日
-        if data_start < prices_df.index[0]:
-            data_start = prices_df.index[0]
-
-        # 数据截止日 = 最晚持仓日
-        data_end = last_holding_ts
-
-    # 筛选日期范围
-    prices_df = prices_df.loc[data_start:data_end]
-    amount_df = amount_df.loc[data_start:data_end]
-
-    if verbose:
-        print(f"回测日期范围:")
-        print(f"    最早持仓日: {first_holding_ts.date()}")
-        print(f"    最晚持仓日: {last_holding_ts.date()}")
-        print(f"数据范围 (含{warmup_years}年预热期):")
-        print(f"    数据起始: {prices_df.index[0].date()}")
-        print(f"    数据截止: {prices_df.index[-1].date()}")
+        print(f"已加载 {n_industries} 个行业的数据")
+        print(f"日期范围: {prices_df.index[0].date()} 至 {prices_df.index[-1].date()}")
         print(f"价格数据 shape: {prices_df.shape}")
         print(f"成交量数据 shape: {amount_df.shape}")
 
@@ -295,281 +146,142 @@ def load_data(
 
 
 # ============================================================================
-# 第一部分: ADF 回归模块 - 完整实现 (支持滞后项 + BIC选择)
+# 第一部分: 快速 OLS 回归模块 - 使用 numpy 矩阵运算 + numba 加速
 # ============================================================================
 
-def ADF_test(y: np.ndarray, IC: int = 2, adflag: int = 6) -> float:
+@jit(nopython=True)
+def _fast_ols_t_stat_numba(y: np.ndarray) -> float:
     """
-    计算 ADF (Augmented Dickey-Fuller) 检验统计量
+    使用 numba 加速的 OLS 回归 t 统计量计算 (内部函数)
 
-    完整复现 R 语言 psymonitor 包的 ADF 函数
-
-    回归方程: Δy_t = α + β * y_{t-1} + Σ(γ_j * Δy_{t-j}) + ε_t
+    回归方程: Δy_t = α + β * y_{t-1} + ε_t  (Lag=0, 无时间趋势项)
 
     参数:
-        y: np.ndarray, 时间序列数据
-        IC: int, 滞后阶数选择方法
-            0 = 固定滞后阶数 (使用 adflag)
-            1 = AIC 选择
-            2 = BIC 选择 (默认，与研报一致)
-        adflag: int, IC=0时为固定滞后阶数；IC>0时为最大滞后阶数 (默认6)
+        y: np.ndarray, 对数价格或对数成交额序列 (float64)
 
     返回:
-        float, ADF t 统计量 (β 系数的 t 值)
+        float, β 系数的 t 统计量
     """
-    T0 = len(y)
-    T1 = T0 - 1
+    n = len(y)
 
-    if T1 < adflag + 3:
+    # 至少需要 3 个数据点才能进行回归
+    if n < 3:
         return np.nan
 
-    # 构造变量
-    y1 = y[:T1]  # y_{t-1}
-    y0 = y[1:T0]  # y_t
-    dy = y0 - y1  # Δy_t
-    const = np.ones(T1)  # 常数项
+    # 构造因变量 Y = Δy[1:] = y[1:] - y[:-1]
+    delta_y = np.diff(y)
+    Y = delta_y
 
-    t = T1 - adflag
-    dof = t - adflag - 2
+    # 构造自变量
+    y_lag = y[:-1]
+    n_obs = len(Y)
 
-    if dof <= 0:
+    # 手动计算 (X'X) 和 (X'Y)，避免创建完整的 X 矩阵
+    # X = [1, y_lag]，所以 X'X 是 2x2 矩阵
+    sum_1 = float(n_obs)
+    sum_y = np.sum(y_lag)
+    sum_y2 = np.sum(y_lag * y_lag)
+
+    # X'X = [[n, sum_y], [sum_y, sum_y2]]
+    det = sum_1 * sum_y2 - sum_y * sum_y
+
+    if abs(det) < 1e-10:
         return np.nan
 
-    if IC > 0:
-        # 使用信息准则选择最优滞后阶数
-        ICC = np.zeros(adflag + 1)
-        ADF_stats = np.zeros(adflag + 1)
+    # (X'X)^(-1) = 1/det * [[sum_y2, -sum_y], [-sum_y, sum_1]]
+    inv_00 = sum_y2 / det
+    inv_01 = -sum_y / det
+    inv_10 = -sum_y / det
+    inv_11 = sum_1 / det
 
-        for k in range(adflag + 1):
-            # 构造设计矩阵
-            # xx 包含 [y_{t-1}, const]
-            xx = np.column_stack([y1[k:T1], const[k:T1]])
-            dy01 = dy[k:T1]
+    # X'Y
+    sum_Y = np.sum(Y)
+    sum_yY = np.sum(y_lag * Y)
 
-            if k > 0:
-                # 添加滞后差分项 Δy_{t-1}, Δy_{t-2}, ..., Δy_{t-k}
-                lag_dy = np.zeros((T1 - k, k))
-                for j in range(1, k + 1):
-                    lag_dy[:, j-1] = dy[k-j:T1-j]
-                x2 = np.column_stack([xx, lag_dy])
-            else:
-                x2 = xx
+    # β̂ = (X'X)^(-1) X'Y
+    beta_0 = inv_00 * sum_Y + inv_01 * sum_yY  # 截距
+    beta_1 = inv_10 * sum_Y + inv_11 * sum_yY  # y_{t-1} 的系数
 
-            n_obs = len(dy01)
-            n_params = x2.shape[1]
+    # 计算残差
+    residuals = Y - beta_0 - beta_1 * y_lag
 
-            if n_obs <= n_params:
-                continue
+    # 计算残差方差 σ² = ε'ε / (n-k)
+    k = 2
+    sse = np.sum(residuals * residuals)
+    sigma_sq = sse / (n_obs - k)
 
-            try:
-                # OLS 回归: β = (X'X)^(-1) X'Y
-                XtX = x2.T @ x2
-                XtY = x2.T @ dy01
-                beta = np.linalg.solve(XtX, XtY)
+    # 计算 β_1 的标准误
+    se_beta = np.sqrt(sigma_sq * inv_11)
 
-                # 残差
-                eps = dy01 - x2 @ beta
-
-                # 信息准则
-                npdf = np.sum(-0.5 * np.log(2 * np.pi) - 0.5 * (eps ** 2))
-
-                if IC == 1:  # AIC
-                    ICC[k] = -2 * npdf / n_obs + 2 * n_params / n_obs
-                else:  # BIC
-                    ICC[k] = -2 * npdf / n_obs + n_params * np.log(n_obs) / n_obs
-
-                # 计算 t 统计量
-                dof_k = n_obs - n_params
-                if dof_k > 0:
-                    se = (eps.T @ eps) / dof_k
-                    var_beta = se * np.linalg.inv(XtX)
-                    sig = np.sqrt(np.diag(var_beta))
-                    ADF_stats[k] = beta[0] / sig[0]  # y_{t-1} 系数的 t 值
-                else:
-                    ADF_stats[k] = np.nan
-
-            except np.linalg.LinAlgError:
-                ICC[k] = np.inf
-                ADF_stats[k] = np.nan
-
-        # 选择最优滞后阶数
-        valid_mask = ~np.isinf(ICC) & ~np.isnan(ADF_stats)
-        if not np.any(valid_mask):
-            return np.nan
-
-        ICC[~valid_mask] = np.inf
-        lag0 = np.argmin(ICC)
-        ADFlag = ADF_stats[lag0]
-
+    if se_beta > 0:
+        t_stat = beta_1 / se_beta
     else:
-        # IC == 0: 固定滞后阶数
-        k = adflag
-        xx = np.column_stack([y1[k:T1], const[k:T1]])
-        dy01 = dy[k:T1]
+        t_stat = np.nan
 
-        if k > 0:
-            lag_dy = np.zeros((T1 - k, k))
-            for j in range(1, k + 1):
-                lag_dy[:, j-1] = dy[k-j:T1-j]
-            x2 = np.column_stack([xx, lag_dy])
-        else:
-            x2 = xx
-
-        n_obs = len(dy01)
-        n_params = x2.shape[1]
-
-        if n_obs <= n_params:
-            return np.nan
-
-        try:
-            XtX = x2.T @ x2
-            XtY = x2.T @ dy01
-            beta = np.linalg.solve(XtX, XtY)
-
-            eps = dy01 - x2 @ beta
-            dof_k = n_obs - n_params
-
-            if dof_k > 0:
-                se = (eps.T @ eps) / dof_k
-                var_beta = se * np.linalg.inv(XtX)
-                sig = np.sqrt(np.diag(var_beta))
-                ADFlag = beta[0] / sig[0]
-            else:
-                ADFlag = np.nan
-
-        except np.linalg.LinAlgError:
-            ADFlag = np.nan
-
-    return ADFlag
+    return t_stat
 
 
-def calc_min_window(obs: int) -> int:
+def fast_ols_t_stat(y) -> float:
     """
-    计算 BSADF 最小窗口长度 (与 R 语言 psymonitor 一致)
+    使用 numpy 矩阵运算计算 ADF 回归的 t 统计量 (Lag=0 简化版)
 
-    公式: swindow0 = floor(T * (0.01 + 1.8 / sqrt(T)))
-
+    回归方程: Δy_t = α + β * y_{t-1} + ε_t
+    
     参数:
-        obs: int, 样本总长度
+        y: np.ndarray 或 pd.Series, 对数价格或对数成交额序列
 
     返回:
-        int, 最小窗口长度
+        float, β 系数的 t 统计量
     """
-    return int(np.floor(obs * (0.01 + 1.8 / np.sqrt(obs))))
+    if isinstance(y, pd.Series):
+        y = y.values
+    y = np.asarray(y, dtype=np.float64)
+    return _fast_ols_t_stat_numba(y)
 
 
 # ============================================================================
 # 第二部分: BSADF (Backward Sup ADF) 泡沫检测模块
 # ============================================================================
 
-def PSY(y: np.ndarray, swindow0: int = None, IC: int = 2, adflag: int = 6) -> np.ndarray:
+def calc_bsadf_stat(series: pd.Series, min_window: int) -> pd.Series:
     """
-    计算 PSY (Phillips, Shi, Yu 2015) 的 BSADF 统计量序列
+    计算 Backward Sup ADF (BSADF) 统计量序列
 
-    完整复现 R 语言 psymonitor 包的 PSY 函数
+    对于每个时间点 t，从最小窗口开始递归扩大窗口，
+    取所有窗口 ADF 统计量的最大值。
 
-    R语言原版逻辑 (1-based索引):
-        for (r2 in swindow0:t) {
-            for (r1 in 1:(r2 - swindow0 + 1)) {
-                rwadft[r1] <- ADF(y[r1:r2], IC, adflag)  # R的y[r1:r2]包含两端
-            }
-            bsadfs[r2] <- max(rwadft)
-        }
-        return bsadfs[swindow0:t]
-
-    参数:
-        y: np.ndarray, 时间序列数据 (对数价格或对数成交额)
-        swindow0: int, 最小窗口长度，默认使用公式 floor(T * (0.01 + 1.8/sqrt(T)))
-        IC: int, 滞后阶数选择方法 (0=固定, 1=AIC, 2=BIC)
-        adflag: int, 最大滞后阶数 (默认6，与研报一致)
-
-    返回:
-        np.ndarray, BSADF 统计量序列 (长度 = T - swindow0 + 1)
-    """
-    t = len(y)
-
-    if swindow0 is None:
-        swindow0 = calc_min_window(t)
-
-    # R: bsadfs <- matrix(data = NA, nrow = t, ncol = 1)
-    bsadfs = np.full(t, np.nan)
-
-    # R: for (r2 in swindow0:t)
-    # R的swindow0:t是从swindow0到t (1-based, 包含两端)
-    # 转换为Python 0-based: r2 从 swindow0-1 到 t-1，即 range(swindow0-1, t)
-    # 但为了与R保持一致的窗口大小，我们用1-based思维：
-    # r2=swindow0 对应窗口 y[1:swindow0] (R) = y[0:swindow0] (Python)
-
-    for r2 in range(swindow0, t + 1):  # r2 从 swindow0 到 t (1-based思维)
-        # R: rwadft <- matrix(data = -999, nrow = r2 - swindow0 + 1, ncol = 1)
-        n_windows = r2 - swindow0 + 1
-        rwadft = np.full(n_windows, -999.0)
-
-        # R: for (r1 in 1:(r2 - swindow0 + 1))
-        # r1 从 1 到 (r2 - swindow0 + 1) (1-based)
-        for r1 in range(1, n_windows + 1):  # r1 从 1 到 n_windows (1-based思维)
-            # R: y[r1:r2] 是从 r1 到 r2 (1-based, 包含两端)
-            # Python: y[r1-1:r2] 是从 r1-1 到 r2-1 (0-based)
-            # 但Python切片不包含end，所以 y[r1-1:r2] 正好对应 R的 y[r1:r2]
-            window_data = y[r1-1:r2]  # 修正：使用1-based到0-based的转换
-
-            if np.any(np.isnan(window_data)):
-                continue
-
-            adf_stat = ADF_test(window_data, IC=IC, adflag=adflag)
-
-            if not np.isnan(adf_stat):
-                rwadft[r1-1] = adf_stat  # r1-1 转换为0-based索引
-
-        # R: bsadfs[r2, 1] <- max(unlist(rwadft))
-        valid_stats = rwadft[rwadft > -999]
-        if len(valid_stats) > 0:
-            bsadfs[r2 - 1] = np.max(valid_stats)  # r2-1 转换为0-based索引
-
-    # R: bsadf <- bsadfs[swindow0:t]
-    # 返回从 swindow0 到 t 的部分 (1-based, 包含两端)
-    # Python: bsadfs[swindow0-1:t]
-    return bsadfs[swindow0 - 1:t]
-
-
-def calc_bsadf_stat(
-    series: pd.Series,
-    min_window: int = None,
-    IC: int = 2,
-    adflag: int = 6
-) -> pd.Series:
-    """
-    计算 Backward Sup ADF (BSADF) 统计量序列 (pandas 接口)
-
-    完整复现 R 语言 psymonitor 包的 PSY 函数
+    时间复杂度: O(N²)
 
     参数:
         series: pd.Series, 对数价格或对数成交额序列
-        min_window: int, 最小窗口长度，默认使用动态公式
-        IC: int, 滞后阶数选择方法 (0=固定, 1=AIC, 2=BIC，默认2)
-        adflag: int, 最大滞后阶数 (默认6)
+        min_window: int, 最小窗口长度 (研报建议 52 周 ≈ 1 年)
 
     返回:
         pd.Series, BSADF 统计量序列
     """
-    values = series.values.astype(np.float64)
-    n = len(values)
-
-    if min_window is None:
-        min_window = calc_min_window(n)
-
-    # 调用核心 PSY 函数
-    bsadf_values = PSY(values, swindow0=min_window, IC=IC, adflag=adflag)
-
-    # 构造输出 Series
+    n = len(series)
     bsadf_stats = pd.Series(index=series.index, dtype=float)
+    values = series.values
 
-    # bsadf_values 的长度是 n - min_window + 1
-    # 对应的索引是 series.index[min_window-1:]
-    start_idx = min_window - 1
-    for i, val in enumerate(bsadf_values):
-        if start_idx + i < n:
-            bsadf_stats.iloc[start_idx + i] = val
+    for t in range(min_window, n):
+        max_adf_stat = -np.inf
+
+        # 递归窗口: 从 [0, t] 到 [t-min_window, t]
+        for s in range(0, t - min_window + 1):
+            window_data = values[s:t + 1]
+
+            if np.any(np.isnan(window_data)):
+                continue
+            if len(window_data) < min_window:
+                continue
+
+            adf_stat = fast_ols_t_stat(window_data)
+
+            if not np.isnan(adf_stat) and adf_stat > max_adf_stat:
+                max_adf_stat = adf_stat
+
+        if max_adf_stat > -np.inf:
+            bsadf_stats.iloc[t] = max_adf_stat
 
     return bsadf_stats
 
@@ -577,16 +289,14 @@ def calc_bsadf_stat(
 def compute_bsadf_signal(
     weekly_close: pd.DataFrame,
     weekly_amount: pd.DataFrame,
-    min_window: int = None,
+    min_window: int = 52,
     compare_window: int = 40,
-    IC: int = 2,
-    adflag: int = 6,
     verbose: bool = True
 ) -> pd.DataFrame:
     """
     计算价量双重 BSADF 信号
 
-    信号逻辑 (严格按照研报):
+    信号逻辑:
         Signal = 1 当且仅当:
             (BSADF_Price > 40周 Price 中位数) AND
             (BSADF_Volume > 40周 Volume 中位数)
@@ -594,10 +304,8 @@ def compute_bsadf_signal(
     参数:
         weekly_close: pd.DataFrame, 周频收盘价
         weekly_amount: pd.DataFrame, 周频成交额
-        min_window: int, BSADF 最小窗口，默认使用动态公式 floor(T*(0.01+1.8/sqrt(T)))
+        min_window: int, BSADF 最小窗口 (默认 52 周)
         compare_window: int, 动态阈值比较窗口 (默认 40 周)
-        IC: int, ADF滞后阶数选择方法 (0=固定, 1=AIC, 2=BIC，默认2与研报一致)
-        adflag: int, 最大滞后阶数 (默认6，与研报一致)
         verbose: bool, 是否打印进度
 
     返回:
@@ -608,33 +316,27 @@ def compute_bsadf_signal(
 
     total_industries = len(industries)
     start_time = time.time()
-
+    
     if verbose:
         print(f"    待处理行业数: {total_industries}")
-        print(f"    ADF参数: IC={IC} (0=固定,1=AIC,2=BIC), adflag={adflag}")
         print(f"    每个行业需计算 2 个 BSADF 序列 (价格 + 成交量)，耗时较长...")
-
+    
     for idx, col in enumerate(industries):
         if verbose:
-            print_progress(idx + 1, total_industries,
+            print_progress(idx + 1, total_industries, 
                           prefix="    BSADF", start_time=start_time)
 
         price_series = weekly_close[col].dropna()
         amount_series = weekly_amount[col].dropna()
 
-        # 动态计算最小窗口
-        n_obs = len(price_series)
-        actual_min_window = min_window if min_window is not None else calc_min_window(n_obs)
-
-        if n_obs < actual_min_window + compare_window:
+        if len(price_series) < min_window + compare_window:
             continue
 
         log_close = np.log(price_series)
         log_amount = np.log(amount_series + 1)  # +1 避免 log(0)
 
-        # 使用完整的 BSADF 计算 (支持滞后项和BIC选择)
-        bsadf_price = calc_bsadf_stat(log_close, min_window=actual_min_window, IC=IC, adflag=adflag)
-        bsadf_amount = calc_bsadf_stat(log_amount, min_window=actual_min_window, IC=IC, adflag=adflag)
+        bsadf_price = calc_bsadf_stat(log_close, min_window)
+        bsadf_amount = calc_bsadf_stat(log_amount, min_window)
 
         common_idx = bsadf_price.dropna().index.intersection(bsadf_amount.dropna().index)
 
@@ -904,6 +606,9 @@ def resample_to_weekly(
     prices.index = pd.to_datetime(prices.index)
     amount.index = pd.to_datetime(amount.index)
 
+    # 记录原始数据的最新日期
+    last_data_date = prices.index[-1]
+
     # 重采样到周五
     weekly_close = prices.resample('W-FRI').last()
     weekly_amount = amount.resample('W-FRI').sum()
@@ -912,6 +617,13 @@ def resample_to_weekly(
     valid_weeks = weekly_close.notna().any(axis=1) & weekly_amount.notna().any(axis=1)
     weekly_close = weekly_close[valid_weeks]
     weekly_amount = weekly_amount[valid_weeks]
+
+    # 剔除最后一个不完整的周（如果周五日期超过了原始数据的最新日期）
+    # 例如：原始数据最新是2026-02-03（周二），resample会生成2026-02-06（周五）
+    # 但2026-02-06的数据实际上不存在，应该剔除
+    if len(weekly_close) > 0 and weekly_close.index[-1] > last_data_date:
+        weekly_close = weekly_close.iloc[:-1]
+        weekly_amount = weekly_amount.iloc[:-1]
 
     # 计算周收益率
     weekly_returns = weekly_close.pct_change()
@@ -922,10 +634,8 @@ def resample_to_weekly(
 def compute_positive_bubble_signal(
     prices_df: pd.DataFrame,
     amount_df: pd.DataFrame,
-    bsadf_min_window: int = None,
+    bsadf_min_window: int = 52,
     bsadf_compare_window: int = 40,
-    bsadf_IC: int = 2,
-    bsadf_adflag: int = 6,
     bocd_hazard: float = 0.01,
     verbose: bool = True
 ) -> pd.DataFrame:
@@ -938,10 +648,8 @@ def compute_positive_bubble_signal(
     参数:
         prices_df: pd.DataFrame, 日频收盘价数据 (index=日期, columns=行业)
         amount_df: pd.DataFrame, 日频成交额数据 (index=日期, columns=行业)
-        bsadf_min_window: int, BSADF 最小窗口 (周)，默认使用动态公式
+        bsadf_min_window: int, BSADF 最小窗口 (周)，默认 52
         bsadf_compare_window: int, BSADF 动态阈值比较窗口 (周)，默认 40
-        bsadf_IC: int, ADF滞后阶数选择 (0=固定, 1=AIC, 2=BIC)，默认2与研报一致
-        bsadf_adflag: int, ADF最大滞后阶数，默认6与研报一致
         bocd_hazard: float, BOCD 变点先验概率，默认 0.01
         verbose: bool, 是否打印进度
 
@@ -960,8 +668,6 @@ def compute_positive_bubble_signal(
         weekly_close, weekly_amount,
         min_window=bsadf_min_window,
         compare_window=bsadf_compare_window,
-        IC=bsadf_IC,
-        adflag=bsadf_adflag,
         verbose=verbose
     )
 
@@ -993,9 +699,65 @@ def compute_positive_bubble_signal(
 # 第五部分: 回测接口
 # ============================================================================
 
+def _calculate_weekly_backtest_dates(
+    data_start: pd.Timestamp,
+    data_end: pd.Timestamp,
+    end_date: str = None,
+    backtest_years: int = 10
+) -> tuple:
+    """
+    计算周频回测的起始和结束日期（与 factors_analysis.py 月频逻辑一致）
+
+    关键：最早持仓年份与月频一致，都是 (最晚持仓年份 - backtest_years)
+
+    参数:
+        data_start: pd.Timestamp, 数据起始日期
+        data_end: pd.Timestamp, 数据结束日期
+        end_date: str, 用户指定的截止日期，None表示使用数据最新日期
+        backtest_years: int, 回测年限
+
+    返回:
+        tuple: (first_holding_date, last_holding_date)
+    """
+    # 确定截止日期
+    if end_date is None:
+        end_dt = data_end
+    else:
+        end_dt = pd.Timestamp(end_date)
+        if end_dt > data_end:
+            end_dt = data_end
+
+    # 最晚持仓日：截止日期之前的最后一个周五
+    days_since_friday = (end_dt.weekday() - 4) % 7
+    if days_since_friday == 0:
+        days_since_friday = 7  # 如果正好是周五，往前推一周
+    last_holding_date = end_dt - pd.Timedelta(days=days_since_friday)
+
+    # 最早持仓日：与月频一致，基于最晚持仓日的年份往前推 backtest_years 年
+    # 月频逻辑：last_holding_date.year - backtest_years 年的12月31日
+    # 周频：找到该年12月最后一个周五
+    first_holding_year = last_holding_date.year - backtest_years
+    dec_31 = pd.Timestamp(year=first_holding_year, month=12, day=31)
+    days_to_friday = (dec_31.weekday() - 4) % 7
+    first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+
+    # 检查数据是否足够
+    if first_holding_date < data_start:
+        first_year = data_start.year
+        if data_start.month > 1 or (data_start.month == 1 and data_start.day > 1):
+            first_year += 1
+        dec_31 = pd.Timestamp(year=first_year, month=12, day=31)
+        days_to_friday = (dec_31.weekday() - 4) % 7
+        first_holding_date = dec_31 - pd.Timedelta(days=days_to_friday)
+
+    return first_holding_date, last_holding_date
+
+
 def backtest_positive_bubble(
     signal_df: pd.DataFrame,
     prices_df: pd.DataFrame,
+    first_holding_date: pd.Timestamp = None,
+    last_holding_date: pd.Timestamp = None,
     verbose: bool = True
 ) -> dict:
     """
@@ -1009,6 +771,8 @@ def backtest_positive_bubble(
     参数:
         signal_df: pd.DataFrame, 周频信号 (0/1)
         prices_df: pd.DataFrame, 日频收盘价数据
+        first_holding_date: pd.Timestamp, 最早持仓日（可选）
+        last_holding_date: pd.Timestamp, 最晚持仓日（可选）
         verbose: bool, 是否打印进度
 
     返回:
@@ -1023,7 +787,7 @@ def backtest_positive_bubble(
             - 'rebalance_details': 每次调仓详情
     """
     start_time = time.time()
-    
+
     # 获取周频价格数据
     prices_df_copy = prices_df.copy()
     prices_df_copy.index = pd.to_datetime(prices_df_copy.index)
@@ -1031,11 +795,20 @@ def backtest_positive_bubble(
 
     # 对齐信号和价格的索引
     common_dates = signal_df.index.intersection(weekly_prices.index)
+
+    # 如果指定了日期范围，进行过滤
+    if first_holding_date is not None:
+        common_dates = common_dates[common_dates >= first_holding_date]
+    if last_holding_date is not None:
+        common_dates = common_dates[common_dates <= last_holding_date]
+
     signal_df = signal_df.loc[common_dates]
     weekly_prices = weekly_prices.loc[common_dates]
 
     if verbose:
         print(f"    有效周数: {len(common_dates)}")
+        if len(common_dates) > 0:
+            print(f"    回测范围: {common_dates[0].date()} 至 {common_dates[-1].date()}")
 
     # 初始化净值序列
     strategy_nav = pd.Series(index=common_dates, dtype=float)
@@ -1127,7 +900,7 @@ def calculate_performance_metrics(
     """
     计算绩效指标
 
-    输出格式: 年化收益率(%) 年化超额收益率(%) 年化波动率(%) 最大回撤(%) 收益风险比 收益回撤比 月度胜率(%)
+    输出格式: 年化收益率(%) 年化波动率(%) 年化超额收益率(%) 累计超额收益率(%) 最大回撤(%) 收益风险比 收益回撤比 月度胜率(%)
 
     参数:
         strategy_nav: pd.Series, 策略净值
@@ -1138,7 +911,9 @@ def calculate_performance_metrics(
     """
     start_date = strategy_nav.index[0]
     end_date = strategy_nav.index[-1]
-    years = (end_date - start_date).days / 365.25
+    # 使用交易日年化：周频数据，每周约5个交易日
+    weeks = len(strategy_nav)
+    years = weeks / 52  # 每年52周
 
     periods_per_year = 52  # 周频
 
@@ -1147,17 +922,17 @@ def calculate_performance_metrics(
     # 年化收益率
     annual_return = ((strategy_nav.iloc[-1] / strategy_nav.iloc[0]) ** (1 / years) - 1) * 100 if years > 0 else 0
 
-    # 基准年化收益率
-    benchmark_annual_return = ((benchmark_nav.iloc[-1] / benchmark_nav.iloc[0]) ** (1 / years) - 1) * 100 if years > 0 else 0
-
-    # 超额净值 = 策略净值 / 基准净值
-    excess_nav = strategy_nav / benchmark_nav
-
-    # 年化超额收益率 (基于超额净值计算)
-    excess_annual_return = ((excess_nav.iloc[-1] / excess_nav.iloc[0]) ** (1 / years) - 1) * 100 if years > 0 else 0
-
     # 年化波动率
     volatility = strategy_returns.std() * np.sqrt(periods_per_year) * 100
+
+    # 超额净值
+    excess_nav = strategy_nav / benchmark_nav
+
+    # 年化超额收益率
+    annual_excess_return = ((excess_nav.iloc[-1] / excess_nav.iloc[0]) ** (1 / years) - 1) * 100 if years > 0 else 0
+
+    # 累计超额收益率
+    total_excess_return = (excess_nav.iloc[-1] / excess_nav.iloc[0] - 1) * 100
 
     # 最大回撤
     cummax = strategy_nav.cummax()
@@ -1171,8 +946,8 @@ def calculate_performance_metrics(
     return_drawdown_ratio = annual_return / max_drawdown if max_drawdown > 0 else 0
 
     # 月度胜率
-    monthly_strategy = strategy_nav.resample('M').last()
-    monthly_benchmark = benchmark_nav.resample('M').last()
+    monthly_strategy = strategy_nav.resample('ME').last()
+    monthly_benchmark = benchmark_nav.resample('ME').last()
 
     monthly_strategy_ret = monthly_strategy.pct_change().dropna()
     monthly_benchmark_ret = monthly_benchmark.pct_change().dropna()
@@ -1183,8 +958,9 @@ def calculate_performance_metrics(
 
     return {
         '年化收益率(%)': round(annual_return, 2),
-        '年化超额收益率(%)': round(excess_annual_return, 2),
         '年化波动率(%)': round(volatility, 2),
+        '年化超额收益率(%)': round(annual_excess_return, 2),
+        '累计超额收益率(%)': round(total_excess_return, 2),
         '最大回撤(%)': round(max_drawdown, 2),
         '收益风险比': round(risk_return_ratio, 2),
         '收益回撤比': round(return_drawdown_ratio, 2),
@@ -1195,34 +971,59 @@ def calculate_performance_metrics(
 def calculate_yearly_returns(
     strategy_nav: pd.Series,
     benchmark_nav: pd.Series,
-    start_year: int = 2017
+    start_year: int = None
 ) -> pd.DataFrame:
     """
-    计算每年的收益统计
+    计算每年的收益统计 (与 factors_analysis.py 逻辑一致)
 
     输出格式: 每年的多头收益% 超额收益% 基准%
 
     参数:
         strategy_nav: pd.Series, 策略净值
         benchmark_nav: pd.Series, 基准净值
-        start_year: int, 起始年份
+        start_year: int, 起始年份 (默认自动检测第一个有效年份)
 
     返回:
         pd.DataFrame: 每年的收益统计
     """
     years = sorted(set(strategy_nav.index.year))
+
+    # 如果未指定起始年份，使用数据的第二年开始（第一年可能不完整）
+    if start_year is None:
+        if len(years) > 1:
+            start_year = years[1]
+        else:
+            start_year = years[0] if years else 2017
+
     years = [y for y in years if y >= start_year]
 
     yearly_data = []
 
-    for year in years:
+    for i, year in enumerate(years):
         year_mask = strategy_nav.index.year == year
         year_dates = strategy_nav.index[year_mask]
 
-        if len(year_dates) < 2:
+        if len(year_dates) == 0:
             continue
 
-        start_date = year_dates[0]
+        # 年度收益的起始日期：使用上一年的最后一个日期
+        if i == 0:
+            # 第一年：找到该年之前的最后一个日期
+            prev_year_mask = strategy_nav.index.year < year
+            if prev_year_mask.any():
+                start_date = strategy_nav.index[prev_year_mask][-1]
+            else:
+                start_date = year_dates[0]
+        else:
+            # 其他年：使用上一年的最后一个日期
+            prev_year = years[i - 1]
+            prev_year_mask = strategy_nav.index.year == prev_year
+            prev_year_dates = strategy_nav.index[prev_year_mask]
+            if len(prev_year_dates) > 0:
+                start_date = prev_year_dates[-1]
+            else:
+                start_date = year_dates[0]
+
         end_date = year_dates[-1]
 
         strategy_return = (strategy_nav.loc[end_date] / strategy_nav.loc[start_date] - 1) * 100
@@ -1237,9 +1038,20 @@ def calculate_yearly_returns(
         })
 
     # 添加全样本统计
-    if len(strategy_nav) >= 2:
-        total_strategy_return = (strategy_nav.iloc[-1] / strategy_nav.iloc[0] - 1) * 100
-        total_bench_return = (benchmark_nav.iloc[-1] / benchmark_nav.iloc[0] - 1) * 100
+    if len(strategy_nav) >= 2 and len(years) > 0:
+        # 全样本起始日期：第一个有效年份之前的最后一个日期
+        first_year = years[0]
+        prev_year_mask = strategy_nav.index.year < first_year
+
+        if prev_year_mask.any():
+            first_valid_date = strategy_nav.index[prev_year_mask][-1]
+        else:
+            first_year_mask = strategy_nav.index.year == first_year
+            first_year_dates = strategy_nav.index[first_year_mask]
+            first_valid_date = first_year_dates[0] if len(first_year_dates) > 0 else strategy_nav.index[0]
+
+        total_strategy_return = (strategy_nav.iloc[-1] / strategy_nav.loc[first_valid_date] - 1) * 100
+        total_bench_return = (benchmark_nav.iloc[-1] / benchmark_nav.loc[first_valid_date] - 1) * 100
         total_excess_return = total_strategy_return - total_bench_return
 
         yearly_data.append({
@@ -1339,10 +1151,8 @@ def clean_industry_name(name: str) -> str:
 def run_full_backtest(
     prices_df: pd.DataFrame,
     amount_df: pd.DataFrame,
-    bsadf_min_window: int = None,
+    bsadf_min_window: int = 52,
     bsadf_compare_window: int = 40,
-    bsadf_IC: int = 2,
-    bsadf_adflag: int = 6,
     bocd_hazard: float = 0.01,
     verbose: bool = True
 ) -> dict:
@@ -1352,10 +1162,8 @@ def run_full_backtest(
     参数:
         prices_df: pd.DataFrame, 日频收盘价数据 (index=日期, columns=行业)
         amount_df: pd.DataFrame, 日频成交额数据 (index=日期, columns=行业)
-        bsadf_min_window: int, BSADF 最小窗口 (周)，默认使用动态公式
+        bsadf_min_window: int, BSADF 最小窗口 (周)，默认 52
         bsadf_compare_window: int, BSADF 动态阈值比较窗口 (周)，默认 40
-        bsadf_IC: int, ADF滞后阶数选择 (0=固定, 1=AIC, 2=BIC)，默认2与研报一致
-        bsadf_adflag: int, ADF最大滞后阶数，默认6与研报一致
         bocd_hazard: float, BOCD 变点先验概率，默认 0.01
         verbose: bool, 是否打印进度
 
@@ -1373,8 +1181,6 @@ def run_full_backtest(
         prices_df, amount_df,
         bsadf_min_window=bsadf_min_window,
         bsadf_compare_window=bsadf_compare_window,
-        bsadf_IC=bsadf_IC,
-        bsadf_adflag=bsadf_adflag,
         bocd_hazard=bocd_hazard,
         verbose=verbose
     )
@@ -1500,19 +1306,18 @@ def export_to_excel(
 
     参数:
         backtest_result: dict, 回测结果
-        output_file: str, 输出文件路径，默认为 "factor分析/positive_bubble_backtest_YYYYMMDD_HHMMSS.xlsx"
+        output_file: str, 输出文件路径，默认为 "positive_bubble_backtest_YYYYMMDD_HHMMSS.xlsx"
         verbose: bool, 是否打印导出信息
 
     返回:
         str: 导出文件路径
     """
     if output_file is None:
-        # 确保输出目录存在
-        if not os.path.exists(OUTPUT_DIR):
-            os.makedirs(OUTPUT_DIR)
-
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = os.path.join(OUTPUT_DIR, f"positive_bubble_backtest_{timestamp}.xlsx")
+        # 输出到 factor分析 文件夹
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'factor分析')
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"positive_bubble_backtest_{timestamp}.xlsx")
 
     if verbose:
         print(f"\n正在导出回测结果到: {output_file}")
@@ -1521,14 +1326,12 @@ def export_to_excel(
         # ========== Sheet 1: 策略概览 ==========
         start_row = 0
 
-        # 因子说明
-        factor_doc = """
-正向泡沫行业轮动因子 (momentum_positive_bubble)
+        # 因子说明（保持一行）
+        factor_doc = """正向泡沫行业轮动因子 (momentum_positive_bubble)
 
 出处：兴业证券《如何结合行业轮动的长短信号？》
 
-理念：利用"理性泡沫"理论，通过 BSADF（量价爆炸检测）和 BOCD（结构突变检测）
-      捕捉行业的起涨点。
+理念：利用"理性泡沫"理论，通过 BSADF（量价爆炸检测）和 BOCD（结构突变检测）捕捉行业的起涨点。
 
 构造：
     1. 数据预处理：日频转周频（W-FRI）
@@ -1539,11 +1342,10 @@ def export_to_excel(
 特点：
     - 返回0/1信号，而非连续因子值
     - 周频调仓（每周五）
-    - 信号=1表示持有，信号=0表示不持有
-"""
+    - 信号=1表示持有，信号=0表示不持有"""
         doc_df = pd.DataFrame({'【因子说明】': [factor_doc]})
         doc_df.to_excel(writer, sheet_name='策略概览', startrow=start_row, index=False)
-        start_row += 20
+        start_row += 3  # 只跳过3行，与 factors_analysis.py 一致
 
         # 绩效指标
         metrics = backtest_result['performance_metrics']
@@ -1609,13 +1411,11 @@ def export_to_excel(
 def main(
     data_file: str = DEFAULT_CACHE_FILE,
     output_file: str = None,
-    backtest_years: int = 10,
-    end_date: str = None,
-    bsadf_min_window: int = None,
+    bsadf_min_window: int = 52,
     bsadf_compare_window: int = 40,
-    bsadf_IC: int = 2,
-    bsadf_adflag: int = 6,
-    bocd_hazard: float = 0.01
+    bocd_hazard: float = 0.01,
+    backtest_years: int = 10,
+    end_date: str = None
 ) -> dict:
     """
     一键运行: 加载数据 -> 计算因子 -> 回测 -> 导出 Excel
@@ -1623,13 +1423,11 @@ def main(
     参数:
         data_file: str, 数据文件路径
         output_file: str, 输出 Excel 文件路径
-        backtest_years: int, 回测年限，默认10年
-        end_date: str, 截止日期，默认使用数据最新日期
-        bsadf_min_window: int, BSADF 最小窗口 (周)，默认使用动态公式
+        bsadf_min_window: int, BSADF 最小窗口 (周)，默认 52
         bsadf_compare_window: int, BSADF 动态阈值比较窗口 (周)，默认 40
-        bsadf_IC: int, ADF滞后阶数选择 (0=固定, 1=AIC, 2=BIC)，默认2与研报一致
-        bsadf_adflag: int, ADF最大滞后阶数，默认6与研报一致
         bocd_hazard: float, BOCD 变点先验概率，默认 0.01
+        backtest_years: int, 回测年限，默认 10 年
+        end_date: str, 截止日期 (格式: 'YYYY-MM-DD')，默认 None 表示使用最新数据
 
     返回:
         dict: 回测结果
@@ -1641,12 +1439,19 @@ def main(
 
     # Step 1: 加载数据
     print("\n[步骤 1/4] 加载数据...")
-    prices_df, amount_df = load_data(
-        data_file,
-        backtest_years=backtest_years,
-        end_date=end_date,
-        verbose=True
+    prices_df, amount_df = load_data(data_file, verbose=True)
+
+    # 计算回测日期范围（与 factors_analysis.py 一致）
+    data_start = prices_df.index[0]
+    data_end = prices_df.index[-1]
+
+    # 计算周频的持仓日期范围
+    first_holding_date, last_holding_date = _calculate_weekly_backtest_dates(
+        data_start, data_end, end_date, backtest_years
     )
+
+    print(f"    回测日期范围: {first_holding_date.date()} 至 {last_holding_date.date()}")
+    print(f"    回测年限: {backtest_years} 年")
 
     # Step 2: 计算因子信号
     print("\n[步骤 2/4] 计算因子信号...")
@@ -1654,15 +1459,18 @@ def main(
         prices_df, amount_df,
         bsadf_min_window=bsadf_min_window,
         bsadf_compare_window=bsadf_compare_window,
-        bsadf_IC=bsadf_IC,
-        bsadf_adflag=bsadf_adflag,
         bocd_hazard=bocd_hazard,
         verbose=True
     )
 
     # Step 3: 运行回测
     print("\n[步骤 3/4] 运行回测...")
-    result = backtest_positive_bubble(signal_df, prices_df, verbose=True)
+    result = backtest_positive_bubble(
+        signal_df, prices_df,
+        first_holding_date=first_holding_date,
+        last_holding_date=last_holding_date,
+        verbose=True
+    )
 
     # 打印绩效指标
     print("\n" + "=" * 60)
