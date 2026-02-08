@@ -1,6 +1,6 @@
 """
 Lasso因子差异排查脚本
-逐步对比 test_lasso_simple.py 和 factors_analysis.py 的计算逻辑
+逐步对比 test_lasso_simple.py 和 factor_ic_backtest.py 的计算逻辑
 """
 import sys
 import os
@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import data_loader
 import factor_
-import factors_analysis as fa
+import factor_value_backtest as fa
 from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')

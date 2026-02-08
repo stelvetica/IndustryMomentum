@@ -16,7 +16,7 @@ from copy import copy
 from datetime import datetime
 # 导入数据加载模块和因子模块
 import data_loader
-import factor_
+import factor_value
 import os
 # 导入openpyxl图表模块
 from openpyxl.chart import LineChart, Reference
@@ -42,11 +42,11 @@ DEFAULT_BACKTEST_YEARS = 10   # 默认回测年限
 #   - lookback_windows: 该因子适用的回看窗口列表，None 表示使用默认的 LOOKBACK_WINDOWS
 #   - requires_constituent: 是否需要成分股数据
 #
-# 按照 factor_.py 中的定义顺序排列
+# 按照 factor_value.py 中的定义顺序排列
 FACTOR_CONFIG = {
     # ===== 基础动量因子（只需要 lookback_window 天）=====
     'momentum': {
-        'func': factor_.momentum,
+        'func': factor_value.momentum,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -54,7 +54,7 @@ FACTOR_CONFIG = {
         'description': '基础动量1-5-传统动量因子（区间收益率）'
     },
     'momentum_zscore': {
-        'func': factor_.momentum_zscore,
+        'func': factor_value.momentum_zscore,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -62,7 +62,7 @@ FACTOR_CONFIG = {
         'description': '基础动量2-5-标准化动量因子（横截面Z-score）'
     },
     'momentum_rank_zscore': {
-        'func': factor_.momentum_rank_zscore,
+        'func': factor_value.momentum_rank_zscore,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -70,7 +70,7 @@ FACTOR_CONFIG = {
         'description': '基础动量3-5-Rank标准化动量因子（排名标准化）'
     },
     'momentum_sharpe': {
-        'func': factor_.momentum_sharpe,
+        'func': factor_value.momentum_sharpe,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -78,7 +78,7 @@ FACTOR_CONFIG = {
         'description': '基础动量4-5-夏普动量因子（风险调整后的动量）'
     },
     'momentum_calmar_ratio': {
-        'func': factor_.momentum_calmar_ratio,
+        'func': factor_value.momentum_calmar_ratio,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -88,7 +88,7 @@ FACTOR_CONFIG = {
 
     # ===== 平稳动量因子 =====
     'momentum_volume_return_corr': {
-        'func': factor_.momentum_volume_return_corr,
+        'func': factor_value.momentum_volume_return_corr,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': [10, 20, 30, 60, 120, 180, 240],  # 研报最优10日，20日也有一定效果
@@ -96,7 +96,7 @@ FACTOR_CONFIG = {
         'description': '平稳动量1-5-量益相关性动量因子（量价同向）'
     },
     'momentum_turnover_adj': {
-        'func': factor_.momentum_turnover_adj,
+        'func': factor_value.momentum_turnover_adj,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -104,7 +104,7 @@ FACTOR_CONFIG = {
         'description': '平稳动量2-5-换手率惩罚动量因子（量价背离）'
     },
     'momentum_rebound_with_crowding_filter': {
-        'func': factor_.momentum_rebound_with_crowding_filter,
+        'func': factor_value.momentum_rebound_with_crowding_filter,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -112,7 +112,7 @@ FACTOR_CONFIG = {
         'description': '平稳动量3-5-反弹综合拥挤过滤动量因子'
     },
     'momentum_amplitude_cut': {
-        'func': factor_.momentum_amplitude_cut,
+        'func': factor_value.momentum_amplitude_cut,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': [20, 60, 90, 120, 160, 240],  # 行业最优参数测试
@@ -120,7 +120,7 @@ FACTOR_CONFIG = {
         'description': '平稳动量4-5-振幅切割稳健动量因子（剔高振幅）'
     },
     'momentum_price_volume_icir': {
-        'func': factor_.momentum_price_volume_icir,
+        'func': factor_value.momentum_price_volume_icir,
         'base_warmup': 240,
         'window_multiplier': 0,
         'lookback_windows': [240], #固定使用10-240日
@@ -130,7 +130,7 @@ FACTOR_CONFIG = {
 
     # ===== 特质收益动量因子 =====
     'momentum_pure_liquidity_stripped': {
-        'func': factor_.momentum_pure_liquidity_stripped,
+        'func': factor_value.momentum_pure_liquidity_stripped,
         'base_warmup': 240,
         'window_multiplier': 1,
         'lookback_windows': None,
@@ -138,7 +138,7 @@ FACTOR_CONFIG = {
         'description': '特质动量1-2-剥离异动提纯动量因子（特质收益）'
     },
     'momentum_residual': {
-        'func': factor_.momentum_residual,
+        'func': factor_value.momentum_residual,
         'base_warmup': 240,  # 12个月月度数据预热（约240交易日）
         'window_multiplier': 0,  # 研报固定使用12个月，不依赖window参数
         'lookback_windows': [240],  # 固定窗口，研报使用12个月回看
@@ -149,7 +149,7 @@ FACTOR_CONFIG = {
 
     # ===== 行业间相关性动量因子 =====
     'momentum_cross_industry_lasso': {
-        'func': factor_.momentum_cross_industry_lasso,
+        'func': factor_value.momentum_cross_industry_lasso,
         'base_warmup': 200,
         'window_multiplier': 1,
         'lookback_windows': [20],
@@ -159,7 +159,7 @@ FACTOR_CONFIG = {
 
     # ===== 行业内关系动量因子（需要成分股数据）=====
     'momentum_industry_component': {
-        'func': factor_.momentum_industry_component,
+        'func': factor_value.momentum_industry_component,
         'base_warmup': 0,  # 无额外固定预热期
         'window_multiplier': 1,  # window已经是交易日数，预热期 = window * 1
         'lookback_windows': [20, 60, 120, 240, 480, 720],  # 交易日数（对应1、3、6、12、24、36个月）
@@ -167,7 +167,7 @@ FACTOR_CONFIG = {
         'description': '行业内动量1-3-行业成分股动量因子 东方'
     },
     'momentum_lead_lag_enhanced': {
-        'func': factor_.momentum_lead_lag_enhanced,
+        'func': factor_value.momentum_lead_lag_enhanced,
         'base_warmup': 0,
         'window_multiplier': 1,
         'lookback_windows': None,  # 原文固定使用20日窗口（1个月）
@@ -176,7 +176,7 @@ FACTOR_CONFIG = {
         'description': '行业内动量2-3-龙头领先修正动量因子'
     },
     'momentum_pca': {
-        'func': factor_.momentum_pca,
+        'func': factor_value.momentum_pca,
         'base_warmup': 125,  # pca_window(120) + lag(5) = 125
         'window_multiplier': 0,  # 动量窗口固定为10天（双周），不使用外部window
         'lookback_windows': [120],  # 固定窗口，与研报一致
@@ -188,7 +188,7 @@ FACTOR_CONFIG = {
     # ===== 多因子合成因子 =====
     # 注意：这两个因子的window参数无实际意义，各成分因子使用各自的最优窗口
     'momentum_synthesis_equal': {
-        'func': factor_.momentum_synthesis_equal,
+        'func': factor_value.momentum_synthesis_equal,
         'base_warmup': 240,  # 最大成分因子窗口（用于预热期计算）
         'window_multiplier': 0,
         'lookback_windows': [1],  # 占位符，实际不使用window参数
@@ -197,7 +197,7 @@ FACTOR_CONFIG = {
         'description': '合成因子1-等权合成动量因子'
     },
     'momentum_synthesis_icir': {
-        'func': factor_.momentum_synthesis_icir,
+        'func': factor_value.momentum_synthesis_icir,
         'base_warmup': 240,  # 最大成分因子窗口（用于预热期计算）
         'window_multiplier': 0,
         'lookback_windows': [1],  # 占位符，实际不使用window参数

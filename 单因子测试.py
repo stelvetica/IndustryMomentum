@@ -17,8 +17,8 @@ for module_name in ['factor_', 'factors_analysis', 'data_loader']:
         importlib.reload(sys.modules[module_name])
 
 import data_loader
-import factors_analysis as fa
-import factor_  # 确保factor_模块被加载
+import factor_value_backtest as fa
+import factor_value  # 确保factor_value模块被加载
 
 # ============================================================
 # 配置区域 - 只需修改这里
@@ -119,7 +119,7 @@ if __name__ == "__main__":
     #run_analysis('momentum_lead_lag_enhanced', '2021-12-31') # 研报截止日期
     #run_analysis('momentum_lead_lag_enhanced', None) # 最新时间
     #run_analysis('momentum_pca', '2024-02-29')
-    #run_analysis('momentum_pca', None)
+    run_analysis('momentum_pca', None)
     #run_analysis('momentum_residual', '2022-02-28')
     #run_analysis('momentum_residual', None)
     #run_analysis('momentum_cross_industry_lasso', '2022-11-30')
@@ -132,5 +132,5 @@ if __name__ == "__main__":
     #run_analysis('momentum_amplitude_cut', None)
     #run_analysis('momentum_volume_return_corr', None)
     #run_analysis('momentum_pure_liquidity_stripped', None)
-    run_analysis('momentum_synthesis_equal', None)
-    run_analysis('momentum_synthesis_icir', None)
+    #run_analysis('momentum_synthesis_equal', None)
+    #run_analysis('momentum_synthesis_icir', None)

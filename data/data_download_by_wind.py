@@ -167,7 +167,7 @@ def save_data(combined_df, industry_df, output_path="data/sw_industry_data.pkl")
 if __name__ == "__main__":
     # ========== 日期参数配置 ==========
     START_DATE = "2010-01-01"  # 数据起始日期
-    END_DATE = "2026-02-03"    # 数据截止日期
+    END_DATE = "2026-02-06"    # 数据截止日期
     # =================================
 
     # ========== 下载数据 ==========
