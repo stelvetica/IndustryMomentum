@@ -55,34 +55,35 @@ def format_time(seconds: float) -> str:
 def print_progress(current: int, total: int, prefix: str = "",
                    start_time: float = None, bar_length: int = 30):
     """
-    打印进度条（单行刷新）
+    打印进度（简单模式，每30秒输出一次，参考factor_value.py）
 
     参数:
         current: int, 当前进度
         total: int, 总数
         prefix: str, 前缀文字
         start_time: float, 开始时间 (time.time())
-        bar_length: int, 进度条长度
+        bar_length: int, 进度条长度（未使用）
     """
-    percent = current / total
-    filled = int(bar_length * percent)
-    bar = "█" * filled + "░" * (bar_length - filled)
+    # 使用静态变量记录上次输出时间
+    if not hasattr(print_progress, 'last_print_time'):
+        print_progress.last_print_time = {}
 
-    # 时间估计
-    time_info = ""
-    if start_time is not None and current > 0:
-        elapsed = time.time() - start_time
-        eta = elapsed / current * (total - current)
-        time_info = f" | 已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
+    now = time.time()
+    key = prefix  # 用prefix区分不同的进度
+    last_time = print_progress.last_print_time.get(key, 0)
 
-    # 使用 ANSI 转义序列清除整行并输出
-    # \033[2K 清除整行, \r 回到行首
-    msg = f"{prefix} |{bar}| {current}/{total} ({percent*100:.1f}%){time_info}"
-    sys.stdout.write('\033[2K\r' + msg)
-    sys.stdout.flush()
+    # 每30秒输出一次，或者第一个/最后一个
+    if current == 1 or current == total or (now - last_time >= 30):
+        print_progress.last_print_time[key] = now
 
-    if current == total:
-        print()  # 换行
+        percent = current / total * 100
+        time_info = ""
+        if start_time is not None and current > 0:
+            elapsed = time.time() - start_time
+            eta = elapsed / current * (total - current)
+            time_info = f" | 已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
+
+        print(f"    {prefix.strip()}: {current}/{total} ({percent:.1f}%){time_info}")
 
 
 # ============================================================================

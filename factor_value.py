@@ -9,6 +9,27 @@ import time
 import sys
 
 
+# ============================================================================
+# 全局常量：日数到月数的映射
+# ============================================================================
+# 用于月频因子将交易日数转换为月数
+# 约20个交易日 = 1个月
+WINDOW_TO_MONTHS = {20: 1, 60: 3, 120: 6, 240: 12, 480: 24, 720: 36}
+
+
+def window_to_months(window):
+    """
+    将交易日数转换为月数
+
+    参数:
+        window: int, 交易日数
+
+    返回:
+        int, 对应的月数
+    """
+    return WINDOW_TO_MONTHS.get(window, max(1, window // 20))
+
+
 class ProgressBar:
     """
     进度条工具类，支持同一行刷新显示进度和时间
@@ -1096,7 +1117,7 @@ def momentum_residual(industry_prices_df, barra_factor_returns_df, window):
 """
 行业间相关性动量因子
 """
-def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_returns=None, train_periods=12):
+def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_returns=None):
     """
     行业间相关性动量因子（基于Lasso回归的领先滞后关系）- 严格按研报逻辑的月频实现。
 
@@ -1131,20 +1152,21 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_r
         prices_df: pd.DataFrame
             行业指数日频价格数据 (index=交易日, columns=行业)，已为后复权价格
         window: int
-            回溯窗口（交易日），仅用于预热期和输出标签，不参与模型结构
+            回溯窗口（交易日），会映射为月数作为训练期：60→3, 120→6, 240→12, 480→24
         rebalance_freq: int
             调仓频率（交易日），为接口兼容参数，本函数内部按月度运算
         benchmark_returns: pd.Series or None
             预留参数（忽略）。函数内部统一按行业等权月度收益构造基准
-        train_periods: int or None
-            训练样本数量上限（以月为单位）。默认12个月（经测试效果最佳）。
-            None 表示使用全部可用历史。
 
     返回:
         pd.DataFrame
             日频因子值 (index=交易日, columns=行业)。
             仅在月末有新值，其余日期向前填充，用于月度调仓回测。
     """
+    # 使用全局函数将日频window映射为月数
+    train_periods = window_to_months(window)
+    print(f"Lasso因子: window={window}天 → 训练期={train_periods}个月")
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
 
@@ -1296,8 +1318,8 @@ def momentum_industry_component(prices_df, window, constituent_df, stock_price_d
     返回:
         pd.DataFrame, 行业成分股动量因子值（月频，仅月末有值）
     """
-    # 将交易日数映射为月数（约20个交易日 = 1个月）
-    window_months = max(1, round(window / 20))
+    # 使用全局函数将交易日数映射为月数
+    window_months = window_to_months(window)
     from data_loader import get_industry_name_to_code_map
 
     # ========== 第一阶段：构建行业名称到行业代码的映射 ==========
@@ -1728,9 +1750,8 @@ def momentum_lead_lag_enhanced(prices_df, window, constituent_df, stock_price_df
     """
     # ========== 第一阶段：窗口映射和月频数据准备 ==========
 
-    # 将日频window映射为月数
-    WINDOW_TO_MONTHS = {20: 1, 60: 3, 120: 6, 240: 12}
-    lookback_months = WINDOW_TO_MONTHS.get(window, max(1, window // 20))
+    # 使用全局函数将日频window映射为月数
+    lookback_months = window_to_months(window)
 
     print(f"龙头领先增强动量因子: window={window}天 → 回看{lookback_months}个月")
 

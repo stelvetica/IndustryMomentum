@@ -52,38 +52,69 @@ def format_time(seconds: float) -> str:
         return f"{hours}小时{mins}分"
 
 
-def print_progress(current: int, total: int, prefix: str = "",
-                   start_time: float = None, bar_length: int = 30):
+class ProgressBar:
     """
-    打印进度条（单行刷新）
-
-    参数:
-        current: int, 当前进度
-        total: int, 总数
-        prefix: str, 前缀文字
-        start_time: float, 开始时间 (time.time())
-        bar_length: int, 进度条长度
+    进度条工具类，每30秒更新一次显示进度和时间
     """
-    percent = current / total
-    filled = int(bar_length * percent)
-    bar = "█" * filled + "░" * (bar_length - filled)
+    def __init__(self, total, desc='进度', update_interval=30.0):
+        """
+        初始化进度条
 
-    # 时间估计
-    time_info = ""
-    if start_time is not None and current > 0:
-        elapsed = time.time() - start_time
-        eta = elapsed / current * (total - current)
-        time_info = f" | 已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
+        参数:
+            total: int, 总任务数
+            desc: str, 描述文字
+            update_interval: float, 更新间隔（秒），默认30秒
+        """
+        self.total = total
+        self.desc = desc
+        self.update_interval = update_interval
+        self.start_time = time.time()
+        self.last_update_time = 0
+        self.current = 0
 
-    # 使用 ANSI 转义序列清除整行并输出
-    # \033[2K 清除整行, \r 回到行首
-    msg = f"{prefix} |{bar}| {current}/{total} ({percent*100:.1f}%){time_info}"
-    sys.stdout.write('\033[2K\r' + msg)
-    sys.stdout.flush()
+        # 在Windows上启用ANSI转义序列支持
+        if sys.platform == 'win32':
+            import os
+            os.system('')  # 启用Windows终端的ANSI支持
 
-    if current == total:
-        print()  # 换行
+    def update(self, current):
+        """更新进度"""
+        self.current = current
+        now = time.time()
 
+        # 控制更新频率：每30秒更新一次，或者完成时更新
+        if now - self.last_update_time < self.update_interval and current < self.total:
+            return
+
+        self.last_update_time = now
+        elapsed = now - self.start_time
+
+        # 计算进度百分比
+        pct = current / self.total * 100
+
+        # 计算预估剩余时间
+        if current > 0:
+            eta = elapsed / current * (self.total - current)
+            eta_str = format_time(eta)
+        else:
+            eta_str = '--:--'
+
+        elapsed_str = format_time(elapsed)
+
+        # 构建消息
+        msg = f'    {self.desc}: {current}/{self.total} ({pct:.1f}%) | 已用: {elapsed_str} | 剩余: {eta_str}'
+
+        # 使用ANSI转义序列清除当前行并输出
+        sys.stdout.write('\033[2K\r' + msg)
+        sys.stdout.flush()
+
+    def finish(self):
+        """完成进度条"""
+        elapsed = time.time() - self.start_time
+        elapsed_str = format_time(elapsed)
+        msg = f'    {self.desc}: {self.total}/{self.total} (100.0%) | 总用时: {elapsed_str}'
+        sys.stdout.write('\033[2K\r' + msg + '\n')
+        sys.stdout.flush()
 
 # ============================================================================
 # 第零部分: 数据加载模块
@@ -315,16 +346,15 @@ def compute_bsadf_signal(
     signal_df = pd.DataFrame(index=weekly_close.index, columns=industries, dtype=float)
 
     total_industries = len(industries)
-    start_time = time.time()
-    
+
     if verbose:
         print(f"    待处理行业数: {total_industries}")
         print(f"    每个行业需计算 2 个 BSADF 序列 (价格 + 成交量)，耗时较长...")
-    
+        progress = ProgressBar(total_industries, desc="BSADF")
+
     for idx, col in enumerate(industries):
         if verbose:
-            print_progress(idx + 1, total_industries, 
-                          prefix="    BSADF", start_time=start_time)
+            progress.update(idx + 1)
 
         price_series = weekly_close[col].dropna()
         amount_series = weekly_amount[col].dropna()
@@ -362,8 +392,7 @@ def compute_bsadf_signal(
                 signal_df.loc[t, col] = 0
 
     if verbose:
-        elapsed = time.time() - start_time
-        print(f"    BSADF 计算完成，总耗时: {format_time(elapsed)}")
+        progress.finish()
 
     return signal_df.fillna(0).astype(float)
 
@@ -535,15 +564,14 @@ def compute_bocd_signal(
     signal_df = pd.DataFrame(index=weekly_returns.index, columns=industries, dtype=float)
 
     total_industries = len(industries)
-    start_time = time.time()
-    
+
     if verbose:
         print(f"    待处理行业数: {total_industries}")
-    
+        progress = ProgressBar(total_industries, desc="BOCD")
+
     for idx, col in enumerate(industries):
         if verbose:
-            print_progress(idx + 1, total_industries,
-                          prefix="    BOCD ", start_time=start_time)
+            progress.update(idx + 1)
 
         returns = weekly_returns[col].dropna()
 
@@ -574,8 +602,7 @@ def compute_bocd_signal(
                 signal_df.loc[t_date, col] = 0
 
     if verbose:
-        elapsed = time.time() - start_time
-        print(f"    BOCD 计算完成，总耗时: {format_time(elapsed)}")
+        progress.finish()
 
     return signal_df.fillna(0).astype(float)
 
@@ -786,8 +813,6 @@ def backtest_positive_bubble(
             - 'yearly_returns': 每年收益统计
             - 'rebalance_details': 每次调仓详情
     """
-    start_time = time.time()
-
     # 获取周频价格数据
     prices_df_copy = prices_df.copy()
     prices_df_copy.index = pd.to_datetime(prices_df_copy.index)
@@ -824,9 +849,12 @@ def backtest_positive_bubble(
 
     # 逐周回测
     total_weeks = len(common_dates)
+    if verbose:
+        progress = ProgressBar(total_weeks - 1, desc="回测")
+
     for i in range(1, total_weeks):
         if verbose:
-            print_progress(i, total_weeks - 1, prefix="    回测  ", start_time=start_time)
+            progress.update(i)
 
         prev_date = common_dates[i - 1]
         curr_date = common_dates[i]
@@ -865,8 +893,7 @@ def backtest_positive_bubble(
     excess_nav = strategy_nav / benchmark_nav
 
     if verbose:
-        elapsed = time.time() - start_time
-        print(f"    回测完成，总耗时: {format_time(elapsed)}")
+        progress.finish()
 
     # 计算绩效指标
     performance_metrics = calculate_performance_metrics(strategy_nav, benchmark_nav)

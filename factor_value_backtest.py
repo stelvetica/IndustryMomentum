@@ -152,7 +152,7 @@ FACTOR_CONFIG = {
         'func': factor_value.momentum_cross_industry_lasso,
         'base_warmup': 200,
         'window_multiplier': 1,
-        'lookback_windows': [20],
+        'lookback_windows': [60, 120, 240, 480],  # 日数→月数：60→3月, 120→6月, 240→12月, 480→24月
         'requires_constituent': False,
         'description': '行业间动量1-1-Lasso因子'
     },
@@ -820,7 +820,7 @@ def calculate_factor_unified_start_date(data: 'DataContainer', factor_name, wind
     return unified_start_date, max_warmup, max_warmup_window
 
 
-def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, split_ratio=None):
+def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFAULT_REBALANCE_FREQ, split_ratio=None, train_periods=None):
     """
     计算单个因子值
 
@@ -830,6 +830,7 @@ def compute_factor(factor_name, data: DataContainer, window, rebalance_freq=DEFA
     window: int, 回溯窗口
     rebalance_freq: int, 调仓频率
     split_ratio: float, 龙头/跟随分割参数（仅用于momentum_lead_lag_enhanced因子）
+    train_periods: int, 训练期（月数），仅用于lasso因子
 
     返回:
     pd.DataFrame: 因子值

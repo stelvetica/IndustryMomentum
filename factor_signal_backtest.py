@@ -190,8 +190,29 @@ def calculate_performance_stats(strategy_nav: pd.Series,
     excess_drawdown = (excess_nav - excess_cummax) / excess_cummax
     excess_max_drawdown = excess_drawdown.min()
 
-    # 日胜率
-    win_rate = (excess_returns > 0).sum() / len(excess_returns) if len(excess_returns) > 0 else 0
+    # 调仓胜率：按调仓频率计算每期超额收益为正的比例
+    strategy_nav_dt = strategy_nav.copy()
+    strategy_nav_dt.index = pd.to_datetime(strategy_nav_dt.index)
+    benchmark_nav_dt = benchmark_nav.copy()
+    benchmark_nav_dt.index = pd.to_datetime(benchmark_nav_dt.index)
+
+    if rebalance_type == 'weekly':
+        # 周频：按周重采样
+        strategy_weekly = strategy_nav_dt.resample('W-FRI').last().dropna()
+        benchmark_weekly = benchmark_nav_dt.resample('W-FRI').last().dropna()
+        strategy_period_returns = strategy_weekly.pct_change().dropna()
+        benchmark_period_returns = benchmark_weekly.pct_change().dropna()
+    else:
+        # 月频：按月重采样
+        strategy_monthly = strategy_nav_dt.resample('ME').last().dropna()
+        benchmark_monthly = benchmark_nav_dt.resample('ME').last().dropna()
+        strategy_period_returns = strategy_monthly.pct_change().dropna()
+        benchmark_period_returns = benchmark_monthly.pct_change().dropna()
+
+    # 对齐后计算超额收益
+    common_idx = strategy_period_returns.index.intersection(benchmark_period_returns.index)
+    excess_period_returns = strategy_period_returns.loc[common_idx] - benchmark_period_returns.loc[common_idx]
+    rebalance_win_rate = (excess_period_returns > 0).sum() / len(excess_period_returns) if len(excess_period_returns) > 0 else 0
 
     return {
         '总收益': total_return,
@@ -205,9 +226,7 @@ def calculate_performance_stats(strategy_nav: pd.Series,
         '信息比率': ir,
         '最大回撤': max_drawdown,
         '超额最大回撤': excess_max_drawdown,
-        '日胜率': win_rate,
-        '回测年数': years,
-        '交易日数': trading_days
+        '调仓胜率': rebalance_win_rate,
     }
 
 
@@ -249,9 +268,9 @@ def calculate_strategy_nav(holdings_history: Dict[pd.Timestamp, List[str]],
             # 空仓，净值不变
             if i + 1 < len(rebalance_dates):
                 next_date = rebalance_dates[i + 1]
-                period_mask = (prices_df.index > date) & (prices_df.index <= next_date)
+                period_mask = (nav.index > date) & (nav.index <= next_date)
             else:
-                period_mask = prices_df.index > date
+                period_mask = nav.index > date
             nav.loc[period_mask] = current_nav
             continue
 
@@ -545,9 +564,64 @@ def write_factor_to_sheet(writer, sheet_name: str, factor_config: Dict,
     rows.append({'A': '信息比率', 'B': f"{stats['信息比率']:.2f}", 'C': '', 'D': '', 'E': '', 'F': ''})
     rows.append({'A': '最大回撤', 'B': f"{stats['最大回撤']:.2%}", 'C': '', 'D': '', 'E': '', 'F': ''})
     rows.append({'A': '超额最大回撤', 'B': f"{stats['超额最大回撤']:.2%}", 'C': '', 'D': '', 'E': '', 'F': ''})
-    rows.append({'A': '日胜率', 'B': f"{stats['日胜率']:.2%}", 'C': '', 'D': '', 'E': '', 'F': ''})
-    rows.append({'A': '回测年数', 'B': f"{stats['回测年数']:.1f}年", 'C': '', 'D': '', 'E': '', 'F': ''})
-    rows.append({'A': '交易日数', 'B': str(stats['交易日数']), 'C': '', 'D': '', 'E': '', 'F': ''})
+    rows.append({'A': '调仓胜率', 'B': f"{stats['调仓胜率']:.2%}", 'C': '', 'D': '', 'E': '', 'F': ''})
+    rows.append({'A': '', 'B': '', 'C': '', 'D': '', 'E': '', 'F': ''})
+
+    # ========== 每年收益统计部分 ==========
+    rows.append({'A': '【每年收益统计】', 'B': '', 'C': '', 'D': '', 'E': '', 'F': ''})
+    rows.append({'A': '年份', 'B': '多头收益(%)', 'C': '超额收益(%)', 'D': '基准收益(%)', 'E': '', 'F': ''})
+
+    # 计算每年收益
+    nav_series = result['nav_series']
+    benchmark_nav = result['benchmark_nav']
+
+    # 对齐索引
+    aligned_benchmark = benchmark_nav.reindex(nav_series.index)
+
+    # 按年分组计算收益
+    nav_df_temp = pd.DataFrame({
+        'strategy': nav_series,
+        'benchmark': aligned_benchmark
+    })
+    nav_df_temp.index = pd.to_datetime(nav_df_temp.index)
+
+    years = nav_df_temp.index.year.unique()
+    yearly_data = []
+
+    for year in sorted(years):
+        year_data = nav_df_temp[nav_df_temp.index.year == year]
+        if len(year_data) < 2:
+            continue
+
+        # 计算该年收益
+        strategy_return = (year_data['strategy'].iloc[-1] / year_data['strategy'].iloc[0] - 1) * 100
+        benchmark_return = (year_data['benchmark'].iloc[-1] / year_data['benchmark'].iloc[0] - 1) * 100
+        excess_return = strategy_return - benchmark_return
+
+        # 判断是否是最后一年（不完整年份）
+        last_date = year_data.index[-1]
+        if year == years.max() and last_date.month < 12:
+            year_label = f"{year}(截至{last_date.month}月{last_date.day}日)"
+        else:
+            year_label = str(year)
+
+        yearly_data.append({
+            'year': year,
+            'year_label': year_label,
+            'strategy': strategy_return,
+            'excess': excess_return,
+            'benchmark': benchmark_return
+        })
+
+        rows.append({'A': year_label, 'B': f"{strategy_return:.2f}", 'C': f"{excess_return:.2f}", 'D': f"{benchmark_return:.2f}", 'E': '', 'F': ''})
+
+    # 添加全样本汇总
+    if len(nav_series) >= 2:
+        total_strategy = (nav_series.iloc[-1] / nav_series.iloc[0] - 1) * 100
+        total_benchmark = (aligned_benchmark.iloc[-1] / aligned_benchmark.iloc[0] - 1) * 100
+        total_excess = total_strategy - total_benchmark
+        rows.append({'A': '全样本', 'B': f"{total_strategy:.2f}", 'C': f"{total_excess:.2f}", 'D': f"{total_benchmark:.2f}", 'E': '', 'F': ''})
+
     rows.append({'A': '', 'B': '', 'C': '', 'D': '', 'E': '', 'F': ''})
 
     # ========== 持仓统计部分 ==========
@@ -568,9 +642,20 @@ def write_factor_to_sheet(writer, sheet_name: str, factor_config: Dict,
 
     current_row = len(rows) + 2
 
-    # ========== 净值序列部分 ==========
+    # ========== 净值序列部分（只保留调仓日） ==========
     nav_series = result['nav_series']
     benchmark_nav = result['benchmark_nav']
+    holdings_history = result['holdings_history']
+
+    # 只保留调仓日的净值
+    rebalance_dates = sorted(holdings_history.keys())
+    nav_series_rebalance = nav_series.reindex(rebalance_dates).dropna()
+    benchmark_rebalance = benchmark_nav.reindex(rebalance_dates).dropna()
+
+    # 取交集
+    common_dates = nav_series_rebalance.index.intersection(benchmark_rebalance.index)
+    nav_series_rebalance = nav_series_rebalance.loc[common_dates]
+    benchmark_rebalance = benchmark_rebalance.loc[common_dates]
 
     # 写入净值序列标题
     ws = writer.sheets[sheet_name]
@@ -578,21 +663,45 @@ def write_factor_to_sheet(writer, sheet_name: str, factor_config: Dict,
     current_row += 1
 
     nav_df = pd.DataFrame({
-        '日期': nav_series.index.strftime('%Y-%m-%d'),
-        '策略净值': nav_series.values,
-        '基准净值': benchmark_nav.reindex(nav_series.index).values,
-        '超额净值': nav_series.values / benchmark_nav.reindex(nav_series.index).values
+        '日期': nav_series_rebalance.index.strftime('%Y-%m-%d'),
+        '策略净值': nav_series_rebalance.values,
+        '基准净值': benchmark_rebalance.values,
     })
     nav_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=current_row)
+
+    # ========== 在G7位置插入净值折线图 ==========
+    from openpyxl.chart import LineChart, Reference
+
+    chart = LineChart()
+    chart.title = "净值序列"
+    chart.style = 10
+    chart.y_axis.title = "净值"
+    chart.x_axis.title = "日期"
+    chart.width = 12  # 约10cm
+    chart.height = 10  # 约12cm (高度)
+
+    # 数据范围：策略净值和基准净值（不含超额净值）
+    data_start_row = current_row + 1  # 标题行
+    data_end_row = current_row + len(nav_df)
+
+    # 策略净值 (B列) 和 基准净值 (C列)
+    data = Reference(ws, min_col=2, min_row=data_start_row, max_col=3, max_row=data_end_row)
+    cats = Reference(ws, min_col=1, min_row=data_start_row + 1, max_row=data_end_row)  # 日期作为X轴
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+
+    # 放置在G7位置
+    ws.add_chart(chart, "G7")
+
     current_row += len(nav_df) + 3
 
-    # ========== 历史持仓部分 ==========
+    # ========== 历史持仓部分（从最新到最久） ==========
     ws.cell(row=current_row, column=1, value='【历史持仓】')
     current_row += 1
 
-    holdings_history = result['holdings_history']
     holdings_data = []
-    for date, holdings in sorted(holdings_history.items()):
+    for date, holdings in sorted(holdings_history.items(), reverse=True):  # reverse=True 从最新到最久
         holdings_data.append({
             '调仓日期': date.strftime('%Y-%m-%d'),
             '持仓数量': len(holdings),
@@ -648,8 +757,11 @@ def export_signal_backtest_to_excel(results: Dict[str, Dict],
         str: 输出文件路径
     """
     if output_file is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f"signal_factor_backtest_{timestamp}.xlsx"
+        # 输出到 factor分析 目录
+        output_dir = r"C:\Users\MECHREVO\001_TEMP\Quant\行业动量\factor分析"
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%H%M%S')
+        output_file = os.path.join(output_dir, f"信号因子统一分析_最新_{timestamp}.xlsx")
 
     if verbose:
         print(f"\n正在导出回测结果到: {output_file}")
@@ -694,8 +806,8 @@ if __name__ == "__main__":
 
     # ========== 1. 加载数据 ==========
     print("\n[Step 1] 加载数据...")
-    # 传入 backtest_years=8 以计算 first_holding_date（与factor_value_backtest.py一致）
-    data = DataContainer(load_constituent=True, backtest_years=8)
+    # 传入 backtest_years=10 以计算 first_holding_date（从2016年开始回测）
+    data = DataContainer(load_constituent=True, backtest_years=10)
     prices_df = data.prices_df
     amount_df = data.amount_df
 
