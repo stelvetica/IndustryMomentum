@@ -1,24 +1,15 @@
 """
-单因子测试脚本
+单因子测试脚本 (run_single_factor_test.py)
 
 职责：
 1. 配置：指定要测试的因子名称和截止日期
-2. 调用组装：调用 factors_analysis 模块完成分析流程
+2. 调用组装：调用 factor_value_backtest 模块完成分析流程
 
-所有计算逻辑在 factors_analysis 模块中实现。
+所有计算逻辑在 factor_value_backtest 模块中实现。
 """
-
-import importlib
-import sys
-
-# 强制重新加载关键模块，避免使用缓存的旧版本
-for module_name in ['factor_', 'factors_analysis', 'data_loader']:
-    if module_name in sys.modules:
-        importlib.reload(sys.modules[module_name])
 
 import data_loader
 import factor_value_backtest as fa
-import factor_value  # 确保factor_value模块被加载
 
 # ============================================================
 # 配置区域 - 只需修改这里

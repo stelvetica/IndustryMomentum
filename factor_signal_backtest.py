@@ -48,12 +48,12 @@ if bubble_dir not in sys.path:
 # ============================================================================
 
 SIGNAL_FACTOR_CONFIG = {
-    'bubble_factor': {
-        'name': '行业泡沫动量1-1-BSADF泡沫BOCD变点因子',
-        'description': '基于BSADF泡沫检测+BOCD变点检测的0/1信号',
-        'rebalance_type': 'weekly',  # 周度调仓
-        'logic': '(Signal_BSADF OR Signal_BOCD) AND (Return_t > 0) → 买入信号',
-    },
+    # 'bubble_factor': {
+    #     'name': '行业泡沫动量1-1-BSADF泡沫BOCD变点因子',
+    #     'description': '基于BSADF泡沫检测+BOCD变点检测的0/1信号',
+    #     'rebalance_type': 'weekly',  # 周度调仓
+    #     'logic': '(Signal_BSADF OR Signal_BOCD) AND (Return_t > 0) → 买入信号',
+    # },
     'intersection_factor': {
         'name': '交集信号因子-合成因子TopN∩泡沫信号',
         'description': '合成因子Top N行业与泡沫信号=1行业的交集',
@@ -155,9 +155,13 @@ def calculate_performance_stats(strategy_nav: pd.Series,
     benchmark_returns = benchmark_nav.pct_change().dropna()
     excess_returns = strategy_returns - benchmark_returns
 
-    # 使用交易日年化（与factor_value_backtest.py一致）
-    trading_days = len(strategy_returns)
-    years = trading_days / 252
+    # 根据调仓频率计算年化因子
+    num_periods = len(strategy_returns)
+    if rebalance_type == 'weekly':
+        periods_per_year = 52  # 周频
+    else:
+        periods_per_year = 12  # 月频
+    years = num_periods / periods_per_year
 
     # 总收益
     total_return = strategy_nav.iloc[-1] / strategy_nav.iloc[0] - 1
@@ -169,9 +173,9 @@ def calculate_performance_stats(strategy_nav: pd.Series,
     benchmark_annual_return = (1 + benchmark_total_return) ** (1 / years) - 1 if years > 0 else 0
     excess_annual_return = annual_return - benchmark_annual_return
 
-    # 年化波动率
-    annual_vol = strategy_returns.std() * np.sqrt(252)
-    excess_vol = excess_returns.std() * np.sqrt(252)
+    # 年化波动率（根据调仓频率）
+    annual_vol = strategy_returns.std() * np.sqrt(periods_per_year)
+    excess_vol = excess_returns.std() * np.sqrt(periods_per_year)
 
     # 夏普比率
     sharpe = annual_return / annual_vol if annual_vol > 0 else 0
@@ -238,7 +242,7 @@ def calculate_strategy_nav(holdings_history: Dict[pd.Timestamp, List[str]],
                            prices_df: pd.DataFrame,
                            start_date: pd.Timestamp = None) -> pd.Series:
     """
-    计算策略净值
+    计算策略净值（按调仓日计算，与factor_value_backtest.py一致）
 
     参数:
         holdings_history: Dict, 持仓历史 {日期: [行业列表]}
@@ -246,7 +250,7 @@ def calculate_strategy_nav(holdings_history: Dict[pd.Timestamp, List[str]],
         start_date: pd.Timestamp, 起始日期
 
     返回:
-        pd.Series: 策略净值序列
+        pd.Series: 策略净值序列（索引为调仓日）
     """
     rebalance_dates = sorted(holdings_history.keys())
     if start_date is not None:
@@ -255,75 +259,73 @@ def calculate_strategy_nav(holdings_history: Dict[pd.Timestamp, List[str]],
     if len(rebalance_dates) == 0:
         return pd.Series(dtype=float)
 
-    # 从第一个调仓日开始
-    first_date = rebalance_dates[0]
-    nav = pd.Series(index=prices_df.loc[first_date:].index, dtype=float)
+    # 初始化净值序列（索引为调仓日）
+    nav = pd.Series(index=rebalance_dates, dtype=float)
     nav.iloc[0] = 1.0
-    current_nav = 1.0
 
-    for i, date in enumerate(rebalance_dates):
-        holdings = holdings_history[date]
+    for i in range(1, len(rebalance_dates)):
+        prev_date = rebalance_dates[i - 1]
+        curr_date = rebalance_dates[i]
+        holdings = holdings_history[prev_date]  # 使用上一期的持仓
 
         if len(holdings) == 0:
             # 空仓，净值不变
-            if i + 1 < len(rebalance_dates):
-                next_date = rebalance_dates[i + 1]
-                period_mask = (nav.index > date) & (nav.index <= next_date)
-            else:
-                period_mask = nav.index > date
-            nav.loc[period_mask] = current_nav
+            nav.iloc[i] = nav.iloc[i - 1]
             continue
-
-        # 计算持仓期收益
-        if i + 1 < len(rebalance_dates):
-            next_date = rebalance_dates[i + 1]
-        else:
-            next_date = prices_df.index[-1]
 
         # 等权持有
         valid_holdings = [h for h in holdings if h in prices_df.columns]
         if len(valid_holdings) == 0:
+            nav.iloc[i] = nav.iloc[i - 1]
             continue
 
-        period_returns = prices_df.loc[date:next_date, valid_holdings].pct_change()
-        period_returns = period_returns.iloc[1:]  # 去掉第一行NaN
+        # 计算期间收益（等权平均）
+        if prev_date in prices_df.index and curr_date in prices_df.index:
+            period_ret = (prices_df.loc[curr_date, valid_holdings] / prices_df.loc[prev_date, valid_holdings] - 1).mean()
+        else:
+            period_ret = 0
 
-        if len(period_returns) > 0:
-            daily_returns = period_returns.mean(axis=1)  # 等权平均
-            for d in daily_returns.index:
-                current_nav *= (1 + daily_returns.loc[d])
-                nav.loc[d] = current_nav
-
-    # 前向填充
-    nav = nav.ffill()
-    nav = nav.fillna(1.0)
+        nav.iloc[i] = nav.iloc[i - 1] * (1 + period_ret)
 
     return nav
 
 
 def calculate_benchmark_nav(prices_df: pd.DataFrame,
-                            start_date: pd.Timestamp) -> pd.Series:
+                            rebalance_dates: List[pd.Timestamp]) -> pd.Series:
     """
-    计算基准净值（行业等权）
+    计算基准净值（行业等权，按调仓日计算，与factor_value_backtest.py一致）
 
     参数:
         prices_df: pd.DataFrame, 价格数据
-        start_date: pd.Timestamp, 起始日期
+        rebalance_dates: List[pd.Timestamp], 调仓日期列表
 
     返回:
-        pd.Series: 基准净值序列
+        pd.Series: 基准净值序列（索引为调仓日）
     """
-    prices_aligned = prices_df.loc[start_date:]
+    # 确保调仓日期在价格数据中存在
+    valid_dates = [d for d in rebalance_dates if d in prices_df.index]
 
-    # 等权日收益率
-    daily_returns = prices_aligned.pct_change().mean(axis=1)
-    daily_returns = daily_returns.fillna(0)
+    if not valid_dates:
+        return pd.Series(dtype=float)
 
-    # 累计净值
-    nav = (1 + daily_returns).cumprod()
-    nav.iloc[0] = 1.0
+    # 初始化基准净值
+    benchmark_nav = pd.Series(index=valid_dates, dtype=float)
+    benchmark_nav.iloc[0] = 1.0
 
-    return nav
+    # 按调仓日计算基准收益
+    for i in range(1, len(valid_dates)):
+        prev_date = valid_dates[i - 1]
+        curr_date = valid_dates[i]
+
+        # 计算期间基准收益（所有行业等权平均）
+        if prev_date in prices_df.index and curr_date in prices_df.index:
+            period_ret = (prices_df.loc[curr_date] / prices_df.loc[prev_date] - 1).mean()
+        else:
+            period_ret = 0
+
+        benchmark_nav.iloc[i] = benchmark_nav.iloc[i - 1] * (1 + period_ret)
+
+    return benchmark_nav
 
 
 # ============================================================================
@@ -378,7 +380,10 @@ def run_bubble_factor_backtest(prices_df: pd.DataFrame,
 
     # 计算净值
     nav_series = calculate_strategy_nav(holdings_history, prices_df, unified_start_date)
-    benchmark_nav = calculate_benchmark_nav(prices_df, unified_start_date)
+
+    # 计算基准净值（按调仓日计算，与factor_value_backtest.py一致）
+    rebalance_dates_list = sorted(holdings_history.keys())
+    benchmark_nav = calculate_benchmark_nav(prices_df, rebalance_dates_list)
 
     # 计算统计指标
     stats = calculate_performance_stats(nav_series, benchmark_nav, rebalance_type='weekly')
@@ -500,7 +505,10 @@ def run_intersection_factor_backtest(prices_df: pd.DataFrame,
 
     # 计算净值
     nav_series = calculate_strategy_nav(holdings_history, prices_df, unified_start_date)
-    benchmark_nav = calculate_benchmark_nav(prices_df, unified_start_date)
+
+    # 计算基准净值（按调仓日计算，与factor_value_backtest.py一致）
+    rebalance_dates_list = sorted(holdings_history.keys())
+    benchmark_nav = calculate_benchmark_nav(prices_df, rebalance_dates_list)
 
     # 计算统计指标
     stats = calculate_performance_stats(nav_series, benchmark_nav, rebalance_type='monthly')
@@ -669,16 +677,41 @@ def write_factor_to_sheet(writer, sheet_name: str, factor_config: Dict,
     })
     nav_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=current_row)
 
-    # ========== 在G7位置插入净值折线图 ==========
+    # ========== 在H18位置插入净值折线图 ==========
     from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart.axis import ChartLines
+    from openpyxl.drawing.line import LineProperties
+    from openpyxl.chart.shapes import GraphicalProperties
+
+    # 创建虚线网格线样式
+    def create_dashed_gridlines():
+        """创建虚线网格线"""
+        gridlines = ChartLines()
+        gridlines.spPr = GraphicalProperties(ln=LineProperties(prstDash='dash'))
+        return gridlines
 
     chart = LineChart()
     chart.title = "净值序列"
-    chart.style = 10
+    chart.style = 2  # 使用简洁样式
     chart.y_axis.title = "净值"
     chart.x_axis.title = "日期"
-    chart.width = 12  # 约10cm
-    chart.height = 10  # 约12cm (高度)
+    chart.width = 18  # 宽18cm（与factor_value_backtest一致）
+    chart.height = 10  # 高10cm（与factor_value_backtest一致）
+
+    # 设置网格线为虚线
+    chart.y_axis.majorGridlines = create_dashed_gridlines()
+    chart.x_axis.majorGridlines = None  # 不显示X轴网格线
+
+    # 显示轴刻度标签
+    chart.x_axis.tickLblPos = "low"
+    chart.y_axis.tickLblPos = "low"
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+
+    # 设置X轴刻度间隔（每隔一定数量显示一个标签）
+    if len(nav_df) > 8:
+        chart.x_axis.tickLblSkip = max(1, len(nav_df) // 8)
+        chart.x_axis.tickMarkSkip = max(1, len(nav_df) // 8)
 
     # 数据范围：策略净值和基准净值（不含超额净值）
     data_start_row = current_row + 1  # 标题行
@@ -691,8 +724,8 @@ def write_factor_to_sheet(writer, sheet_name: str, factor_config: Dict,
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
 
-    # 放置在G7位置
-    ws.add_chart(chart, "G7")
+    # 放置在H5位置
+    ws.add_chart(chart, "H5")
 
     current_row += len(nav_df) + 3
 
@@ -819,20 +852,20 @@ if __name__ == "__main__":
     unified_start_date = get_unified_start_date_from_data(data)
     print(f"  统一起始日期: {unified_start_date.strftime('%Y-%m-%d')} (来自DataContainer.first_holding_date)")
 
-    # ========== 3. 运行泡沫因子回测 ==========
-    print("\n[Step 3] 运行泡沫因子回测...")
-    bubble_result = run_bubble_factor_backtest(
-        prices_df, amount_df, unified_start_date, verbose=True
-    )
-    print(f"  泡沫因子回测完成")
-    for key, value in bubble_result['stats'].items():
-        if isinstance(value, float):
-            print(f"    {key}: {value:.2%}" if abs(value) < 100 else f"    {key}: {value:.2f}")
-        else:
-            print(f"    {key}: {value}")
+    # ========== 3. 运行泡沫因子回测（已注释）==========
+    # print("\n[Step 3] 运行泡沫因子回测...")
+    # bubble_result = run_bubble_factor_backtest(
+    #     prices_df, amount_df, unified_start_date, verbose=True
+    # )
+    # print(f"  泡沫因子回测完成")
+    # for key, value in bubble_result['stats'].items():
+    #     if isinstance(value, float):
+    #         print(f"    {key}: {value:.2%}" if abs(value) < 100 else f"    {key}: {value:.2f}")
+    #     else:
+    #         print(f"    {key}: {value}")
 
     # ========== 4. 运行交集因子回测 ==========
-    print("\n[Step 4] 运行交集因子回测...")
+    print("\n[Step 3] 运行交集因子回测...")
     intersection_result = run_intersection_factor_backtest(
         prices_df, amount_df, unified_start_date, top_n=6, verbose=True
     )
@@ -844,9 +877,9 @@ if __name__ == "__main__":
             print(f"    {key}: {value}")
 
     # ========== 5. 导出Excel ==========
-    print("\n[Step 5] 导出Excel...")
+    print("\n[Step 4] 导出Excel...")
     results = {
-        'bubble_factor': bubble_result,
+        # 'bubble_factor': bubble_result,
         'intersection_factor': intersection_result
     }
     output_file = export_signal_backtest_to_excel(results, verbose=True)

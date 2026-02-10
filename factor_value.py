@@ -1197,7 +1197,9 @@ def momentum_cross_industry_lasso(prices_df, window, rebalance_freq, benchmark_r
                                     dtype=float)
 
         # 至少需要的训练样本数（以月为单位）
-        min_train_samples = 10
+        # 如果指定了train_periods，则使用train_periods作为最小样本数（但至少需要3个月）
+        # 否则默认需要10个月
+        min_train_samples = max(3, train_periods) if train_periods is not None else 10
 
         # 有效样本 s 范围：1 <= s <= T-2
         #   s 对应调仓日 months[s]，持有区间 [months[s], months[s+1]]

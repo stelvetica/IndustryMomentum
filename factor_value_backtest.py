@@ -3627,50 +3627,6 @@ def format_excel_report(file_path: str):
     wb.save(file_path)
 
 
-# ============================================================
-# 泡沫因子调用接口
-# ============================================================
-
-def run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=None):
-    """
-    运行泡沫因子分析（周频调仓）
-
-    调用 bubble/positive_bubble_factor_core.py 中的主函数
-
-    参数:
-        backtest_years: int, 回测年限，默认10年（当前版本未使用，保留接口兼容性）
-        end_date: str, 截止日期，默认使用数据最新日期（当前版本未使用，保留接口兼容性）
-
-    返回:
-        dict: 回测结果
-    """
-    try:
-        # 尝试导入泡沫因子模块
-        import sys
-        bubble_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bubble')
-        if bubble_dir not in sys.path:
-            sys.path.insert(0, bubble_dir)
-
-        from positive_bubble_factor_core import main as bubble_main
-
-        print("\n" + "=" * 60)
-        print("运行泡沫因子分析（周频调仓）")
-        print("=" * 60)
-
-        # 调用泡沫因子主函数（泡沫因子模块内部管理数据加载和回测期限）
-        result = bubble_main()
-
-        return result
-
-    except ImportError as e:
-        print(f"\n错误: 无法导入泡沫因子模块 - {e}")
-        print("请确保 bubble/positive_bubble_factor_core.py 文件存在")
-        return None
-    except Exception as e:
-        print(f"\n错误: 运行泡沫因子时出错 - {e}")
-        return None
-
-
 if __name__ == "__main__":
     import time
     start_time = time.time()
@@ -3736,8 +3692,3 @@ if __name__ == "__main__":
     print(f"\n分析完成！报告已保存至: {output_file}")
     print(f"总耗时: {hours}小时{minutes}分钟" if hours > 0 else f"总耗时: {minutes}分钟")
 
-    # ========== 运行泡沫因子分析（周频调仓）==========
-    print("\n" + "=" * 60)
-    print("开始运行泡沫因子分析（周频调仓）...")
-    print("=" * 60)
-    run_bubble_factor(backtest_years=DEFAULT_BACKTEST_YEARS, end_date=end_date)
